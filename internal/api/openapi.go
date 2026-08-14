@@ -21,6 +21,23 @@ func openAPISpecification() map[string]any {
 					},
 				},
 			},
+			"/api/v1/live/events": map[string]any{
+				"get": map[string]any{
+					"operationId": "streamLiveStatus",
+					"summary":     "Stream current collector status and live traffic",
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Server-sent status events with periodic keepalives",
+							"content": map[string]any{"text/event-stream": map[string]any{
+								"schema": map[string]any{
+									"type":        "string",
+									"description": "Status events contain JSON matching the Status schema; comment frames are keepalives.",
+								},
+							}},
+						},
+					},
+				},
+			},
 			"/api/v1/openapi.json": map[string]any{
 				"get": map[string]any{
 					"operationId": "getOpenAPI",
@@ -38,12 +55,13 @@ func openAPISpecification() map[string]any {
 						"timestamp":  map[string]any{"type": "string", "format": "date-time"},
 						"collector": map[string]any{
 							"type":     "object",
-							"required": []string{"state", "reason", "message", "lastSample"},
+							"required": []string{"state", "reason", "message", "controllerVersion", "lastSample"},
 							"properties": map[string]any{
-								"state":      map[string]any{"type": "string", "enum": []string{"unavailable", "connecting", "connected"}},
-								"reason":     map[string]any{"type": "string"},
-								"message":    map[string]any{"type": "string"},
-								"lastSample": map[string]any{"type": []string{"string", "null"}, "format": "date-time"},
+								"state":             map[string]any{"type": "string", "enum": []string{"unavailable", "connecting", "connected"}},
+								"reason":            map[string]any{"type": "string"},
+								"message":           map[string]any{"type": "string"},
+								"controllerVersion": map[string]any{"type": []string{"string", "null"}},
+								"lastSample":        map[string]any{"type": []string{"string", "null"}, "format": "date-time"},
 							},
 						},
 						"live": map[string]any{

@@ -115,6 +115,10 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 			t.Fatalf("status schema is missing %q", requiredProperty)
 		}
 	}
+	paths := document["paths"].(map[string]any)
+	if _, ok := paths["/api/v1/live/events"]; !ok {
+		t.Fatal("OpenAPI is missing the live event stream")
+	}
 
 	statusResponse := httptest.NewRecorder()
 	handler.ServeHTTP(statusResponse, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
