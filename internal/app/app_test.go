@@ -15,6 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/app"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/storage"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/testcontroller"
 )
 
@@ -119,11 +120,12 @@ func TestServeStreamsLiveTrafficFromMihomoWithoutImportingTheBaseline(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	outputReader, outputWriter := io.Pipe()
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
 	environment := map[string]string{
 		"MIHOMO_MONITOR_CONTROLLER_URL":    controller.URL,
 		"MIHOMO_MONITOR_CONTROLLER_SECRET": secret,
 		"MIHOMO_MONITOR_DASHBOARD_ADDRESS": "127.0.0.1:0",
-		"MIHOMO_MONITOR_DATABASE_PATH":     filepath.Join(t.TempDir(), "data", "traffic.db"),
+		"MIHOMO_MONITOR_DATABASE_PATH":     databasePath,
 		"MIHOMO_MONITOR_SAMPLE_INTERVAL":   "50ms",
 	}
 	lookup := func(key string) (string, bool) { value, ok := environment[key]; return value, ok }
@@ -172,6 +174,19 @@ func TestServeStreamsLiveTrafficFromMihomoWithoutImportingTheBaseline(t *testing
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not stop after cancellation")
+	}
+
+	reopened, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen traffic database: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	summary, err := reopened.Summary(time.Now().UTC().Add(-time.Hour), time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("query shutdown traffic: %v", err)
+	}
+	if summary.Upload.Residual != 500 || summary.Download.Residual != 1_000 || summary.Total.Total != 1_500 {
+		t.Fatalf("shutdown did not durably settle pending global growth: %+v", summary)
 	}
 }
 

@@ -145,6 +145,19 @@ func TestReconcilerCapsObservedAndPreservesGlobalDirectionalTotalsAcrossMinuteBo
 	}
 }
 
+func TestReconcilerSettlesPendingAuthoritativeGrowthBeforeCounterReset(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	reconciler := traffic.NewReconciler()
+	reconciler.Add(traffic.Sample{At: start, UploadTotal: 100, DownloadTotal: 200})
+	if records := reconciler.Add(traffic.Sample{At: start.Add(time.Second), UploadTotal: 110, DownloadTotal: 230}); len(records) != 0 {
+		t.Fatalf("pending growth settled before its window expired: %+v", records)
+	}
+	records := reconciler.Add(traffic.Sample{At: start.Add(2 * time.Second), UploadTotal: 2, DownloadTotal: 240})
+	assertTraffic(t, records, start.Truncate(time.Minute), traffic.Residual, "", "", 10, 40)
+}
+
 func assertTraffic(t *testing.T, records []traffic.Record, minute time.Time, class traffic.Class, app, host string, upload, download int64) {
 	t.Helper()
 	for _, record := range records {

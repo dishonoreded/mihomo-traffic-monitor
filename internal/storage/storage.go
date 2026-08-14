@@ -49,6 +49,37 @@ type TrafficSummary struct {
 	Hosts    []Leader
 }
 
+type leaderQuery struct {
+	name      string
+	statement string
+}
+
+var appLeaders = leaderQuery{
+	name: "App",
+	statement: `
+		SELECT dimension.name, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
+		FROM minute_traffic AS traffic
+		JOIN apps AS dimension ON dimension.id = traffic.app_id
+		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
+		GROUP BY dimension.id, dimension.name
+		ORDER BY SUM(traffic.upload_bytes + traffic.download_bytes) DESC, dimension.name ASC
+		LIMIT 5
+	`,
+}
+
+var hostLeaders = leaderQuery{
+	name: "Host",
+	statement: `
+		SELECT dimension.host, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
+		FROM minute_traffic AS traffic
+		JOIN endpoints AS dimension ON dimension.id = traffic.endpoint_id
+		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
+		GROUP BY dimension.id, dimension.host
+		ORDER BY SUM(traffic.upload_bytes + traffic.download_bytes) DESC, dimension.host ASC
+		LIMIT 5
+	`,
+}
+
 func Open(path string) (*Store, error) {
 	dataDirectory := filepath.Dir(path)
 	if err := ensurePrivateDataDirectory(dataDirectory); err != nil {
@@ -308,11 +339,11 @@ func (store *Store) Summary(start, end time.Time) (TrafficSummary, error) {
 	if result.Total.Total > 0 {
 		result.Coverage = float64(result.Total.Observed) / float64(result.Total.Total)
 	}
-	result.Apps, err = store.leaders(start, end, "apps", "app_id")
+	result.Apps, err = store.leaders(start, end, appLeaders)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
-	result.Hosts, err = store.leaders(start, end, "endpoints", "endpoint_id")
+	result.Hosts, err = store.leaders(start, end, hostLeaders)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
@@ -334,36 +365,23 @@ func finalizeTotals(totals *AttributionTotals) {
 	totals.Total = totals.Observed + totals.Residual + totals.GapRecovered
 }
 
-func (store *Store) leaders(start, end time.Time, table, foreignKey string) ([]Leader, error) {
-	nameColumn := "name"
-	if table == "endpoints" {
-		nameColumn = "host"
-	}
-	query := fmt.Sprintf(`
-		SELECT dimension.%s, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
-		FROM minute_traffic AS traffic
-		JOIN %s AS dimension ON dimension.id = traffic.%s
-		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
-		GROUP BY dimension.id, dimension.%s
-		ORDER BY SUM(traffic.upload_bytes + traffic.download_bytes) DESC, dimension.%s ASC
-		LIMIT 5
-	`, nameColumn, table, foreignKey, nameColumn, nameColumn)
-	rows, err := store.database.Query(query, unixCeiling(start), unixCeiling(end))
+func (store *Store) leaders(start, end time.Time, query leaderQuery) ([]Leader, error) {
+	rows, err := store.database.Query(query.statement, unixCeiling(start), unixCeiling(end))
 	if err != nil {
-		return nil, fmt.Errorf("query %s leaders: %w", table, err)
+		return nil, fmt.Errorf("query %s leaders: %w", query.name, err)
 	}
 	defer rows.Close()
 	leaders := []Leader{}
 	for rows.Next() {
 		var leader Leader
 		if err := rows.Scan(&leader.Name, &leader.Upload, &leader.Download); err != nil {
-			return nil, fmt.Errorf("scan %s leader: %w", table, err)
+			return nil, fmt.Errorf("scan %s leader: %w", query.name, err)
 		}
 		leader.Total = leader.Upload + leader.Download
 		leaders = append(leaders, leader)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate %s leaders: %w", table, err)
+		return nil, fmt.Errorf("iterate %s leaders: %w", query.name, err)
 	}
 	return leaders, nil
 }

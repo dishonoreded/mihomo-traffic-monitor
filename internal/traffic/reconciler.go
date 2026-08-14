@@ -143,10 +143,18 @@ func (reconciler *Reconciler) Add(current Sample) []Record {
 	}
 	previous := reconciler.previous
 	if current.UploadTotal < previous.UploadTotal || current.DownloadTotal < previous.DownloadTotal {
-		reconciler.globals = nil
-		reconciler.candidates = nil
+		records := reconciler.Flush()
+		upload := monotonicGrowth(current.UploadTotal, previous.UploadTotal)
+		download := monotonicGrowth(current.DownloadTotal, previous.DownloadTotal)
+		if upload > 0 || download > 0 {
+			records = append(records, Record{
+				Minute: current.At.UTC().Truncate(time.Minute),
+				Class:  Residual,
+				Upload: upload, Download: download,
+			})
+		}
 		reconciler.previous = &current
-		return nil
+		return aggregateRecords(records)
 	}
 
 	reconciler.sequence++
@@ -314,6 +322,13 @@ func firstNonEmpty(values ...string) string {
 func counterGrowth(current, previous int64) int64 {
 	if current < previous {
 		return nonNegative(current)
+	}
+	return current - previous
+}
+
+func monotonicGrowth(current, previous int64) int64 {
+	if current < previous {
+		return 0
 	}
 	return current - previous
 }
