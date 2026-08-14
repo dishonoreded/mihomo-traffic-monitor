@@ -1,12 +1,6 @@
 package api
 
-type collectorState string
-
-const (
-	collectorUnavailable collectorState = "unavailable"
-	collectorConnecting  collectorState = "connecting"
-	collectorConnected   collectorState = "connected"
-)
+import "github.com/dishonoreded/mihomo-traffic-monitor/internal/collector"
 
 type controllerAuthentication string
 
@@ -25,10 +19,11 @@ type statusResponse struct {
 }
 
 type collectorStatus struct {
-	State      collectorState `json:"state"`
-	Reason     string         `json:"reason"`
-	Message    string         `json:"message"`
-	LastSample *string        `json:"lastSample"`
+	State             collector.State  `json:"state"`
+	Reason            collector.Reason `json:"reason"`
+	Message           string           `json:"message"`
+	ControllerVersion *string          `json:"controllerVersion"`
+	LastSample        *string          `json:"lastSample"`
 }
 
 type liveStatus struct {

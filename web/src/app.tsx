@@ -4,10 +4,12 @@ type Route = "/" | "/analyze" | "/status";
 
 interface StatusResponse {
   apiVersion: string;
+  timestamp: string;
   collector: {
     state: "unavailable" | "connecting" | "connected";
     reason: string;
     message: string;
+    controllerVersion: string | null;
     lastSample: string | null;
   };
   live: {
@@ -31,6 +33,11 @@ interface StatusResponse {
   };
 }
 
+interface RatePoint {
+  upload: number;
+  download: number;
+}
+
 const routes: Array<{ path: Route; label: string }> = [
   { path: "/", label: "Overview" },
   { path: "/analyze", label: "Analyze" },
@@ -40,21 +47,52 @@ const routes: Array<{ path: Route; label: string }> = [
 export function App() {
   const [route, setRoute] = useState<Route>(normalizeRoute(window.location.pathname));
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [rateHistory, setRateHistory] = useState<RatePoint[]>([]);
   const [requestError, setRequestError] = useState("");
 
   useEffect(() => {
     const abort = new AbortController();
+    let receivedLiveEvent = false;
+    const acceptStatus = (nextStatus: StatusResponse) => {
+      setStatus(nextStatus);
+      setRateHistory((current) => [
+        ...current,
+        {
+          upload: nextStatus.live.uploadBytesPerSecond,
+          download: nextStatus.live.downloadBytesPerSecond,
+        },
+      ].slice(-36));
+      setRequestError("");
+    };
     fetch("/api/v1/status", { signal: abort.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error(`Status request failed (${response.status})`);
         return (await response.json()) as StatusResponse;
       })
-      .then(setStatus)
+      .then((initialStatus) => {
+        if (!receivedLiveEvent) acceptStatus(initialStatus);
+      })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
         setRequestError(error instanceof Error ? error.message : "Status is unavailable");
       });
-    return () => abort.abort();
+
+    let events: EventSource | null = null;
+    if (typeof EventSource !== "undefined") {
+      events = new EventSource("/api/v1/live/events");
+      events.addEventListener("status", (event) => {
+        receivedLiveEvent = true;
+        try {
+          acceptStatus(JSON.parse((event as MessageEvent<string>).data) as StatusResponse);
+        } catch {
+          setRequestError("Live status contained an invalid response");
+        }
+      });
+    }
+    return () => {
+      abort.abort();
+      events?.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -79,7 +117,11 @@ export function App() {
       </header>
 
       <section className="signal-rail" aria-label="Local observatory signal path">
-        <Signal label="Controller" value={status?.collector.state === "connected" ? "Connected" : "Unavailable"} tone="unknown" />
+        <Signal
+          label="Controller"
+          value={collectorLabel(status?.collector.state)}
+          tone={status?.collector.state === "connected" ? "download" : "unknown"}
+        />
         <span className="rail-line" aria-hidden="true" />
         <Signal label="Sample" value={status?.configuration.sampleInterval ?? "1s"} />
         <span className="rail-line" aria-hidden="true" />
@@ -102,7 +144,7 @@ export function App() {
       </nav>
 
       {requestError ? <p className="request-error" role="alert">{requestError}. Check that the local process is still running.</p> : null}
-      <main>{route === "/" ? <Overview status={status} /> : route === "/analyze" ? <Analyze /> : <Status status={status} />}</main>
+      <main>{route === "/" ? <Overview status={status} history={rateHistory} /> : route === "/analyze" ? <Analyze /> : <Status status={status} />}</main>
 
       <footer>
         <span>Local only</span>
@@ -117,26 +159,33 @@ function Signal({ label, value, tone = "neutral" }: { label: string; value: stri
   return <div className={`signal signal-${tone}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function Overview({ status }: { status: StatusResponse | null }) {
+function Overview({ status, history }: { status: StatusResponse | null; history: RatePoint[] }) {
+  const connected = status?.collector.state === "connected";
+  const heading = connected ? "Traffic is live" : status?.collector.state === "connecting" ? "Connecting" : "Controller unavailable";
+  const upload = status?.live.uploadBytesPerSecond ?? 0;
+  const download = status?.live.downloadBytesPerSecond ?? 0;
   return (
     <div className="page-grid overview-page">
       <section className="hero-panel">
-        <div className="eyebrow">Live traffic / awaiting signal</div>
-        <div className="trace-field" aria-label="Live traffic trace is waiting for Controller data">
+        <div className="eyebrow">Live traffic / {connected ? "streaming" : "awaiting signal"}</div>
+        <div className="trace-field">
           <span className="trace-axis" />
-          <div className="trace-message"><strong>Signal pending</strong><span>Connect Mihomo to begin a live trace.</span></div>
+          {connected ? <TrafficTrace history={history} upload={upload} download={download} /> : (
+            <div className="trace-message" role="status"><strong>Signal pending</strong><span>Connect Mihomo to begin a live trace.</span></div>
+          )}
           <span className="trace-label upload">Upload</span>
           <span className="trace-label download">Download</span>
         </div>
       </section>
       <aside className="readout-panel">
         <p className="eyebrow">Collector state</p>
-        <h1>Controller unavailable</h1>
+        <h1>{heading}</h1>
         <p>{status?.collector.message ?? "The local observatory is ready. Waiting for its first status reading."}</p>
         <dl className="readouts">
+          <div className="readout-upload"><dt>Upload now</dt><dd>{formatRate(upload)}</dd></div>
+          <div className="readout-download"><dt>Download now</dt><dd>{formatRate(download)}</dd></div>
           <div><dt>Active connections</dt><dd>{status?.live.activeConnections ?? 0}</dd></div>
           <div><dt>Database</dt><dd>{status?.database.healthy ? "Database ready" : "Checking"}</dd></div>
-          <div><dt>Stored history</dt><dd>None yet</dd></div>
         </dl>
       </aside>
       <section className="empty-strip">
@@ -144,6 +193,21 @@ function Overview({ status }: { status: StatusResponse | null }) {
         <div><h2>Collection starts from a clean baseline</h2><p>Traffic from before the first Controller connection will not be imported.</p></div>
       </section>
     </div>
+  );
+}
+
+function TrafficTrace({ history, upload, download }: { history: RatePoint[]; upload: number; download: number }) {
+  const points = history.length > 0 ? history : [{ upload, download }];
+  const peak = Math.max(1, ...points.flatMap((point) => [point.upload, point.download]));
+  const x = (index: number) => points.length === 1 ? 360 : (index / (points.length - 1)) * 720;
+  const uploadPoints = points.map((point, index) => `${x(index)},${150 - (point.upload / peak) * 112}`).join(" ");
+  const downloadPoints = points.map((point, index) => `${x(index)},${150 + (point.download / peak) * 112}`).join(" ");
+  const label = `Upload ${formatRate(upload)} above baseline; download ${formatRate(download)} below baseline`;
+  return (
+    <svg className="traffic-trace" viewBox="0 0 720 300" preserveAspectRatio="none" role="img" aria-label={label}>
+      <polyline className="trace-line trace-upload" points={uploadPoints} />
+      <polyline className="trace-line trace-download" points={downloadPoints} />
+    </svg>
   );
 }
 
@@ -163,7 +227,7 @@ function Status({ status }: { status: StatusResponse | null }) {
     <section className="status-page">
       <div><p className="eyebrow">System diagnostics</p><h1>Local observatory</h1><p>Only non-sensitive configuration is shown.</p></div>
       <dl className="diagnostic-grid">
-        <Diagnostic label="Controller" value={status?.configuration.controllerUrl ?? "Checking"} detail={status?.collector.message ?? "Reading local status"} />
+        <Diagnostic label="Controller" value={status?.configuration.controllerUrl ?? "Checking"} detail={controllerDetail(status)} />
         <Diagnostic label="Database" value={status?.database.healthy ? "Database ready" : "Checking"} detail={status ? `${status.database.journalMode.toUpperCase()} · schema ${status.database.schemaVersion}` : "Opening private storage"} />
         <Diagnostic label="Database size" value={formatBytes(status?.database.sizeBytes ?? 0)} detail="Permanent minute history" />
         <Diagnostic label="Database location" value={status?.configuration.databasePath ?? "Checking"} detail="Private local storage · permanent retention" />
@@ -181,7 +245,25 @@ function normalizeRoute(path: string): Route {
   return path === "/analyze" || path === "/status" ? path : "/";
 }
 
+function collectorLabel(state: StatusResponse["collector"]["state"] | undefined): string {
+  if (state === "connected") return "Connected";
+  if (state === "connecting") return "Connecting";
+  return "Unavailable";
+}
+
+function controllerDetail(status: StatusResponse | null): string {
+  if (!status) return "Reading local status";
+  if (status.collector.controllerVersion) return `${status.collector.message} · Mihomo ${status.collector.controllerVersion}`;
+  return status.collector.message;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatRate(bytesPerSecond: number): string {
+  return `${formatBytes(bytesPerSecond)}/s`;
 }

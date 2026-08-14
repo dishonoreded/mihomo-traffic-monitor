@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/api"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/collector"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/config"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/storage"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/version"
@@ -50,8 +51,16 @@ func serve(ctx context.Context, args []string, lookup EnvironmentLookup, home st
 	if err != nil {
 		return fmt.Errorf("listen on local dashboard: %w", err)
 	}
+	collectionContext, stopCollection := context.WithCancel(ctx)
+	defer stopCollection()
+	monitor := collector.New(collector.Config{
+		ControllerURL:    configuration.ControllerURL,
+		ControllerSecret: configuration.ControllerSecret,
+		SampleInterval:   configuration.SampleInterval,
+	})
+	go monitor.Run(collectionContext)
 	server := &http.Server{
-		Handler:           api.NewHandler(configuration, store, webui.Assets()),
+		Handler:           api.NewHandlerWithCollector(configuration, store, webui.Assets(), monitor),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
