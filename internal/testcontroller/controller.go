@@ -25,6 +25,22 @@ type Controller struct {
 	ConnectionStreams atomic.Int32
 }
 
+type TrafficConnection struct {
+	ID            string
+	Upload        int64
+	Download      int64
+	Process       string
+	SniffHost     string
+	Host          string
+	DestinationIP string
+}
+
+type TrafficSnapshot struct {
+	UploadTotal   int64
+	DownloadTotal int64
+	Connections   []TrafficConnection
+}
+
 func Start(t testing.TB, options Options) *Controller {
 	t.Helper()
 	controller := &Controller{}
@@ -79,17 +95,27 @@ func DisconnectedURL() string {
 }
 
 func WriteSnapshot(ctx context.Context, connection *websocket.Conn, uploadTotal, downloadTotal, upload, download int64) error {
-	payload, err := json.Marshal(map[string]any{
-		"uploadTotal":   uploadTotal,
-		"downloadTotal": downloadTotal,
-		"connections": []any{
-			map[string]any{
-				"id":       "connection-1",
-				"upload":   upload,
-				"download": download,
-				"metadata": map[string]any{"process": "Safari", "host": "example.com", "destinationIP": "203.0.113.10"},
+	return WriteTrafficSnapshot(ctx, connection, TrafficSnapshot{
+		UploadTotal: uploadTotal, DownloadTotal: downloadTotal,
+		Connections: []TrafficConnection{{
+			ID: "connection-1", Upload: upload, Download: download,
+			Process: "Safari", Host: "example.com", DestinationIP: "203.0.113.10",
+		}},
+	})
+}
+
+func WriteTrafficSnapshot(ctx context.Context, connection *websocket.Conn, snapshot TrafficSnapshot) error {
+	connections := make([]any, 0, len(snapshot.Connections))
+	for _, item := range snapshot.Connections {
+		connections = append(connections, map[string]any{
+			"id": item.ID, "upload": item.Upload, "download": item.Download,
+			"metadata": map[string]any{
+				"process": item.Process, "sniffHost": item.SniffHost, "host": item.Host, "destinationIP": item.DestinationIP,
 			},
-		},
+		})
+	}
+	payload, err := json.Marshal(map[string]any{
+		"uploadTotal": snapshot.UploadTotal, "downloadTotal": snapshot.DownloadTotal, "connections": connections,
 	})
 	if err != nil {
 		return err

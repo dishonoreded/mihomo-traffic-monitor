@@ -52,13 +52,21 @@ func serve(ctx context.Context, args []string, lookup EnvironmentLookup, home st
 		return fmt.Errorf("listen on local dashboard: %w", err)
 	}
 	collectionContext, stopCollection := context.WithCancel(ctx)
-	defer stopCollection()
 	monitor := collector.New(collector.Config{
 		ControllerURL:    configuration.ControllerURL,
 		ControllerSecret: configuration.ControllerSecret,
 		SampleInterval:   configuration.SampleInterval,
+		TrafficSink:      store,
 	})
-	go monitor.Run(collectionContext)
+	collectionDone := make(chan struct{})
+	go func() {
+		defer close(collectionDone)
+		monitor.Run(collectionContext)
+	}()
+	defer func() {
+		stopCollection()
+		<-collectionDone
+	}()
 	server := &http.Server{
 		Handler:           api.NewHandlerWithCollector(configuration, store, webui.Assets(), monitor),
 		ReadHeaderTimeout: 5 * time.Second,

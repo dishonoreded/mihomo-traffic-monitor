@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/api"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/config"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/storage"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 )
 
 func TestStatusReportsPrivateLocalObservatoryState(t *testing.T) {
@@ -71,7 +73,7 @@ func TestStatusReportsPrivateLocalObservatoryState(t *testing.T) {
 	if body.APIVersion != "v1" || body.Collector.State != "unavailable" {
 		t.Fatalf("unexpected API/collector state: %+v", body)
 	}
-	if !body.Database.Healthy || body.Database.SchemaVersion != 1 || body.Database.SizeBytes <= 0 {
+	if !body.Database.Healthy || body.Database.SchemaVersion != 2 || body.Database.SizeBytes <= 0 {
 		t.Fatalf("unexpected database state: %+v", body.Database)
 	}
 	if body.Configuration.ControllerURL != cfg.ControllerURL || body.Configuration.DashboardAddress != cfg.DashboardAddress || body.Configuration.SampleInterval != "1s" {
@@ -79,6 +81,90 @@ func TestStatusReportsPrivateLocalObservatoryState(t *testing.T) {
 	}
 	if body.Configuration.ControllerAuthentication != "configured" {
 		t.Fatalf("authentication diagnostic = %q, want configured", body.Configuration.ControllerAuthentication)
+	}
+}
+
+func TestSummaryReturnsHalfOpenAttributionTotalsCoverageAndLeaders(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: start, Class: traffic.Observed, App: "Safari", Host: "example.com", RegistrableDomain: "example.com", Upload: 20, Download: 80},
+		{Minute: start, Class: traffic.Residual, Upload: 5, Download: 15},
+		{Minute: start.Add(time.Minute), Class: traffic.GapRecovered, Upload: 7, Download: 13},
+	}); err != nil {
+		t.Fatalf("seed traffic: %v", err)
+	}
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	path := "/api/v1/summary?start=" + url.QueryEscape(start.Format(time.RFC3339)) + "&end=" + url.QueryEscape(start.Add(time.Minute).Format(time.RFC3339))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("summary status = %d: %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		APIVersion string `json:"apiVersion"`
+		Range      struct {
+			Start string `json:"start"`
+			End   string `json:"end"`
+		} `json:"range"`
+		Upload   storage.AttributionTotals `json:"upload"`
+		Download storage.AttributionTotals `json:"download"`
+		Total    storage.AttributionTotals `json:"total"`
+		Coverage float64                   `json:"coverage"`
+		Leaders  struct {
+			Apps  []storage.Leader `json:"apps"`
+			Hosts []storage.Leader `json:"hosts"`
+		} `json:"leaders"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if payload.APIVersion != "v1" || payload.Range.Start != start.Format(time.RFC3339) || payload.Range.End != start.Add(time.Minute).Format(time.RFC3339) {
+		t.Fatalf("summary range = %+v, API = %q", payload.Range, payload.APIVersion)
+	}
+	if payload.Total != (storage.AttributionTotals{Observed: 100, Residual: 20, Total: 120}) {
+		t.Fatalf("summary total = %+v", payload.Total)
+	}
+	if payload.Coverage != float64(100)/120 || len(payload.Leaders.Apps) != 1 || payload.Leaders.Apps[0].Name != "Safari" || len(payload.Leaders.Hosts) != 1 {
+		t.Fatalf("summary coverage/leaders = %f %+v", payload.Coverage, payload.Leaders)
+	}
+}
+
+func TestSummaryRejectsMissingMalformedAndEmptyRanges(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	for _, path := range []string{
+		"/api/v1/summary",
+		"/api/v1/summary?start=not-a-time&end=2026-08-14T01:00:00Z",
+		"/api/v1/summary?start=2026-08-14T01:00:00Z&end=2026-08-14T01:00:00Z",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		var payload struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode range error: %v", err)
+		}
+		if response.Code != http.StatusBadRequest || payload.Error.Code != "invalid_time_range" {
+			t.Fatalf("%s = status %d code %q", path, response.Code, payload.Error.Code)
+		}
 	}
 }
 
@@ -118,6 +204,12 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 	paths := document["paths"].(map[string]any)
 	if _, ok := paths["/api/v1/live/events"]; !ok {
 		t.Fatal("OpenAPI is missing the live event stream")
+	}
+	if _, ok := paths["/api/v1/summary"]; !ok {
+		t.Fatal("OpenAPI is missing the traffic summary")
+	}
+	if _, ok := schemas["Summary"]; !ok {
+		t.Fatal("OpenAPI is missing the Summary schema")
 	}
 
 	statusResponse := httptest.NewRecorder()
