@@ -57,6 +57,7 @@ func serve(ctx context.Context, args []string, lookup EnvironmentLookup, home st
 		ControllerURL:    configuration.ControllerURL,
 		ControllerSecret: configuration.ControllerSecret,
 		SampleInterval:   configuration.SampleInterval,
+		TrafficSink:      store,
 	})
 	go monitor.Run(collectionContext)
 	server := &http.Server{

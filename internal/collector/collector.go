@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 )
 
 type State string
@@ -34,12 +35,19 @@ const (
 	ReasonIncompatibleVersion  Reason = "incompatible_version"
 	ReasonInvalidSchema        Reason = "invalid_schema"
 	ReasonDisconnected         Reason = "disconnected"
+	ReasonStorageFailed        Reason = "storage_failed"
 )
+
+type TrafficSink interface {
+	AddTraffic([]traffic.Record) error
+}
 
 type Config struct {
 	ControllerURL    string
 	ControllerSecret string
 	SampleInterval   time.Duration
+	TrafficSink      TrafficSink
+	Now              func() time.Time
 }
 
 type Snapshot struct {
@@ -151,7 +159,7 @@ func (collector *Collector) transitionSnapshot(state State, reason Reason, messa
 	return snapshot
 }
 
-func (collector *Collector) collect(ctx context.Context) error {
+func (collector *Collector) collect(ctx context.Context) (result error) {
 	version, err := collector.probeVersion(ctx)
 	if err != nil {
 		return err
@@ -168,6 +176,12 @@ func (collector *Collector) collect(ctx context.Context) error {
 	}
 	defer connection.CloseNow()
 	connection.SetReadLimit(16 << 20)
+	reconciler := traffic.NewReconciler()
+	defer func() {
+		if err := collector.persist(reconciler.Flush()); err != nil {
+			result = err
+		}
+	}()
 
 	var previous wireSnapshot
 	var previousAt time.Time
@@ -187,7 +201,14 @@ func (collector *Collector) collect(ctx context.Context) error {
 		if err := validateSnapshot(current); err != nil {
 			return collectionError{reason: ReasonInvalidSchema, message: "Mihomo returned an incompatible connections payload: " + err.Error()}
 		}
-		now := time.Now().UTC()
+		now := collector.now().UTC()
+		trafficSample, err := toTrafficSample(current, now)
+		if err != nil {
+			return collectionError{reason: ReasonInvalidSchema, message: "Mihomo returned an incompatible connections payload: " + err.Error()}
+		}
+		if err := collector.persist(reconciler.Add(trafficSample)); err != nil {
+			return err
+		}
 		live := Snapshot{
 			State:             StateConnected,
 			Reason:            ReasonConnected,
@@ -208,6 +229,49 @@ func (collector *Collector) collect(ctx context.Context) error {
 		previous = current
 		previousAt = now
 	}
+}
+
+func (collector *Collector) now() time.Time {
+	if collector.configuration.Now != nil {
+		return collector.configuration.Now()
+	}
+	return time.Now()
+}
+
+func (collector *Collector) persist(records []traffic.Record) error {
+	if collector.configuration.TrafficSink == nil || len(records) == 0 {
+		return nil
+	}
+	if err := collector.configuration.TrafficSink.AddTraffic(records); err != nil {
+		return collectionError{reason: ReasonStorageFailed, message: "Traffic history could not be written to the local database. Check database status and available disk space."}
+	}
+	return nil
+}
+
+func toTrafficSample(snapshot wireSnapshot, at time.Time) (traffic.Sample, error) {
+	result := traffic.Sample{At: at, UploadTotal: *snapshot.UploadTotal, DownloadTotal: *snapshot.DownloadTotal}
+	result.Connections = make([]traffic.Connection, 0, len(snapshot.Connections))
+	for _, connection := range snapshot.Connections {
+		var metadata struct {
+			Process       string `json:"process"`
+			SniffHost     string `json:"sniffHost"`
+			Host          string `json:"host"`
+			DestinationIP string `json:"destinationIP"`
+		}
+		if err := json.Unmarshal(connection.Metadata, &metadata); err != nil {
+			return traffic.Sample{}, fmt.Errorf("connection metadata is invalid")
+		}
+		result.Connections = append(result.Connections, traffic.Connection{
+			ID:            connection.ID,
+			Upload:        *connection.Upload,
+			Download:      *connection.Download,
+			Process:       metadata.Process,
+			SniffHost:     metadata.SniffHost,
+			Host:          metadata.Host,
+			DestinationIP: metadata.DestinationIP,
+		})
+	}
+	return result, nil
 }
 
 func (collector *Collector) probeVersion(ctx context.Context) (string, error) {

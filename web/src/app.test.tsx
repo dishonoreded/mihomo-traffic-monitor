@@ -20,7 +20,7 @@ const statusResponse = {
   database: {
     healthy: true,
     sizeBytes: 12288,
-    schemaVersion: 1,
+    schemaVersion: 2,
     journalMode: "wal",
     error: null,
   },
@@ -33,6 +33,30 @@ const statusResponse = {
   },
 };
 
+const summaryResponse = {
+	apiVersion: "v1",
+	range: { start: "2026-08-14T00:00:00+08:00", end: "2026-08-14T15:00:00+08:00" },
+	upload: { observed: 40000, residual: 10000, gapRecovered: 0, total: 50000 },
+	download: { observed: 60000, residual: 15000, gapRecovered: 0, total: 75000 },
+	total: { observed: 100000, residual: 25000, gapRecovered: 0, total: 125000 },
+	coverage: 0.8,
+	leaders: {
+		apps: [
+			{ name: "Safari", upload: 30000, download: 40000, total: 70000 },
+			{ name: "curl", upload: 10000, download: 20000, total: 30000 },
+		],
+		hosts: [{ name: "example.com", upload: 25000, download: 35000, total: 60000 }],
+	},
+};
+
+function mockAPI() {
+	return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+		const path = String(input);
+		const payload = path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+		return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -40,18 +64,17 @@ afterEach(() => {
 });
 
 test("user can inspect the unavailable local observatory and navigate its empty states", async () => {
-  vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(JSON.stringify(statusResponse), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }),
-  );
+  mockAPI();
   const user = userEvent.setup();
 
   render(<App />);
 
   expect(await screen.findByText("Controller unavailable")).toBeVisible();
   expect(screen.getByText("Database ready")).toBeVisible();
+  expect(await screen.findByText("80.0%")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Today" })).toBeVisible();
+  expect(screen.getByText("Safari")).toBeVisible();
+  expect(screen.getByText("example.com")).toBeVisible();
   expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
 
   await user.click(screen.getByRole("link", { name: "Analyze" }));
@@ -60,7 +83,7 @@ test("user can inspect the unavailable local observatory and navigate its empty 
 
   await user.click(screen.getByRole("link", { name: "Status" }));
   expect(screen.getByText("http://127.0.0.1:9090")).toBeVisible();
-  expect(screen.getByText("WAL · schema 1")).toBeVisible();
+  expect(screen.getByText("WAL · schema 2")).toBeVisible();
   expect(screen.getByText(statusResponse.configuration.databasePath)).toBeVisible();
 });
 
@@ -86,9 +109,7 @@ test("live events drive the directional trace and current connection readouts", 
     }
   }
   vi.stubGlobal("EventSource", FakeEventSource);
-  vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(JSON.stringify(statusResponse), { status: 200, headers: { "Content-Type": "application/json" } }),
-  );
+  mockAPI();
 
   render(<App />);
   await screen.findByText("Controller unavailable");

@@ -38,6 +38,30 @@ interface RatePoint {
   download: number;
 }
 
+interface AttributionTotals {
+  observed: number;
+  residual: number;
+  gapRecovered: number;
+  total: number;
+}
+
+interface Leader {
+  name: string;
+  upload: number;
+  download: number;
+  total: number;
+}
+
+interface SummaryResponse {
+  apiVersion: string;
+  range: { start: string; end: string };
+  upload: AttributionTotals;
+  download: AttributionTotals;
+  total: AttributionTotals;
+  coverage: number;
+  leaders: { apps: Leader[]; hosts: Leader[] };
+}
+
 const routes: Array<{ path: Route; label: string }> = [
   { path: "/", label: "Overview" },
   { path: "/analyze", label: "Analyze" },
@@ -49,6 +73,8 @@ export function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [rateHistory, setRateHistory] = useState<RatePoint[]>([]);
   const [requestError, setRequestError] = useState("");
+  const [summary, setSummary] = useState<SummaryResponse | null>(null);
+  const [summaryError, setSummaryError] = useState("");
 
   useEffect(() => {
     const abort = new AbortController();
@@ -92,6 +118,31 @@ export function App() {
     return () => {
       abort.abort();
       events?.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const loadSummary = () => {
+      fetch(todaySummaryURL(), { signal: abort.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`History request failed (${response.status})`);
+          return (await response.json()) as SummaryResponse;
+        })
+        .then((nextSummary) => {
+          setSummary(nextSummary);
+          setSummaryError("");
+        })
+        .catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          setSummaryError(error instanceof Error ? error.message : "Today's history is unavailable");
+        });
+    };
+    loadSummary();
+    const refresh = window.setInterval(loadSummary, 15_000);
+    return () => {
+      window.clearInterval(refresh);
+      abort.abort();
     };
   }, []);
 
@@ -144,7 +195,7 @@ export function App() {
       </nav>
 
       {requestError ? <p className="request-error" role="alert">{requestError}. Check that the local process is still running.</p> : null}
-      <main>{route === "/" ? <Overview status={status} history={rateHistory} /> : route === "/analyze" ? <Analyze /> : <Status status={status} />}</main>
+      <main>{route === "/" ? <Overview status={status} history={rateHistory} summary={summary} summaryError={summaryError} /> : route === "/analyze" ? <Analyze /> : <Status status={status} />}</main>
 
       <footer>
         <span>Local only</span>
@@ -159,7 +210,7 @@ function Signal({ label, value, tone = "neutral" }: { label: string; value: stri
   return <div className={`signal signal-${tone}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function Overview({ status, history }: { status: StatusResponse | null; history: RatePoint[] }) {
+function Overview({ status, history, summary, summaryError }: { status: StatusResponse | null; history: RatePoint[]; summary: SummaryResponse | null; summaryError: string }) {
   const connected = status?.collector.state === "connected";
   const heading = connected ? "Traffic is live" : status?.collector.state === "connecting" ? "Connecting" : "Controller unavailable";
   const upload = status?.live.uploadBytesPerSecond ?? 0;
@@ -188,11 +239,46 @@ function Overview({ status, history }: { status: StatusResponse | null; history:
           <div><dt>Database</dt><dd>{status?.database.healthy ? "Database ready" : "Checking"}</dd></div>
         </dl>
       </aside>
-      <section className="empty-strip">
-        <span className="empty-index">00:00</span>
-        <div><h2>Collection starts from a clean baseline</h2><p>Traffic from before the first Controller connection will not be imported.</p></div>
+      <section className="history-band" aria-labelledby="today-heading">
+        <div className="today-summary">
+          <div className="history-heading">
+            <p className="eyebrow">Permanent minute history</p>
+            <h2 id="today-heading">Today</h2>
+          </div>
+          {summaryError ? <p className="history-error" role="status">{summaryError}</p> : (
+            <dl className="daily-totals">
+              <div><dt>Total</dt><dd>{formatBytes(summary?.total.total ?? 0)}</dd></div>
+              <div className="daily-upload"><dt>Upload</dt><dd>{formatBytes(summary?.upload.total ?? 0)}</dd></div>
+              <div className="daily-download"><dt>Download</dt><dd>{formatBytes(summary?.download.total ?? 0)}</dd></div>
+              <div className="daily-coverage"><dt>Coverage</dt><dd>{formatCoverage(summary?.coverage ?? 0)}</dd></div>
+            </dl>
+          )}
+        </div>
+        <div className="leader-columns">
+          <LeaderList title="Apps" leaders={summary?.leaders.apps ?? []} />
+          <LeaderList title="Hosts" leaders={summary?.leaders.hosts ?? []} />
+        </div>
       </section>
     </div>
+  );
+}
+
+function LeaderList({ title, leaders }: { title: string; leaders: Leader[] }) {
+  return (
+    <section className="leader-list" aria-label={`${title} leaders`}>
+      <h3>{title}</h3>
+      {leaders.length === 0 ? <p>No observed traffic yet</p> : (
+        <ol>
+          {leaders.map((leader) => (
+            <li key={leader.name}>
+              <span className="leader-rank" aria-hidden="true">{String(leaders.indexOf(leader) + 1).padStart(2, "0")}</span>
+              <strong>{leader.name}</strong>
+              <span>{formatBytes(leader.total)}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -266,4 +352,15 @@ function formatBytes(bytes: number): string {
 
 function formatRate(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatCoverage(coverage: number): string {
+  return `${(coverage * 100).toFixed(1)}%`;
+}
+
+function todaySummaryURL(): string {
+  const end = new Date();
+  const start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  const query = new URLSearchParams({ start: start.toISOString(), end: end.toISOString() });
+  return `/api/v1/summary?${query.toString()}`;
 }

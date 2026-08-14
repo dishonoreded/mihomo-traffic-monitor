@@ -38,6 +38,7 @@ func newHandler(configuration config.Config, store *storage.Store, assets fs.FS,
 	srv := &server{configuration: configuration, store: store, assets: assets, monitor: monitor, keepalive: keepalive}
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/status", getOnly(http.HandlerFunc(srv.status)))
+	mux.Handle("/api/v1/summary", getOnly(http.HandlerFunc(srv.summary)))
 	mux.Handle("/api/v1/live/events", getOnly(http.HandlerFunc(srv.liveEvents)))
 	mux.Handle("/api/v1/openapi.json", getOnly(http.HandlerFunc(srv.openAPIDocument)))
 	mux.HandleFunc("/api/", srv.apiNotFound)
@@ -63,6 +64,59 @@ func getOnly(next http.Handler) http.Handler {
 
 func (srv *server) status(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, srv.statusPayload())
+}
+
+type summaryRange struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+type summaryLeaders struct {
+	Apps  []storage.Leader `json:"apps"`
+	Hosts []storage.Leader `json:"hosts"`
+}
+
+type summaryResponse struct {
+	APIVersion string                    `json:"apiVersion"`
+	Range      summaryRange              `json:"range"`
+	Upload     storage.AttributionTotals `json:"upload"`
+	Download   storage.AttributionTotals `json:"download"`
+	Total      storage.AttributionTotals `json:"total"`
+	Coverage   float64                   `json:"coverage"`
+	Leaders    summaryLeaders            `json:"leaders"`
+}
+
+func (srv *server) summary(response http.ResponseWriter, request *http.Request) {
+	start, startErr := time.Parse(time.RFC3339, request.URL.Query().Get("start"))
+	end, endErr := time.Parse(time.RFC3339, request.URL.Query().Get("end"))
+	if startErr != nil || endErr != nil || !end.After(start) {
+		writeJSON(response, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{
+				"code":    "invalid_time_range",
+				"message": "Provide start and end as RFC3339 timestamps with end after start; the range is [start, end).",
+			},
+		})
+		return
+	}
+	result, err := srv.store.Summary(start, end)
+	if err != nil {
+		writeJSON(response, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{
+				"code":    "database_query_failed",
+				"message": "Traffic history could not be read from the local database.",
+			},
+		})
+		return
+	}
+	writeJSON(response, http.StatusOK, summaryResponse{
+		APIVersion: "v1",
+		Range:      summaryRange{Start: start.Format(time.RFC3339Nano), End: end.Format(time.RFC3339Nano)},
+		Upload:     result.Upload,
+		Download:   result.Download,
+		Total:      result.Total,
+		Coverage:   result.Coverage,
+		Leaders:    summaryLeaders{Apps: result.Apps, Hosts: result.Hosts},
+	})
 }
 
 func (srv *server) statusPayload() statusResponse {
