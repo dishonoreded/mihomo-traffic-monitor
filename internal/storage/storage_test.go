@@ -1,9 +1,12 @@
 package storage_test
 
 import (
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,6 +260,369 @@ func TestMinuteTrafficUPSERTAndHalfOpenSummarySurviveReopen(t *testing.T) {
 	}
 	if fractional.Total.Total != 0 {
 		t.Fatalf("fractional half-open start included the preceding minute: %+v", fractional)
+	}
+}
+
+func TestSeriesKeepsRepeatedDaylightSavingHoursDistinctAndPreservesTotals(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	zone, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load test time zone: %v", err)
+	}
+	starts := []time.Time{
+		time.Date(2026, 11, 1, 4, 30, 0, 0, time.UTC),
+		time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC),
+		time.Date(2026, 11, 1, 6, 30, 0, 0, time.UTC),
+		time.Date(2026, 11, 1, 7, 30, 0, 0, time.UTC),
+	}
+	for index, minute := range starts {
+		if err := store.AddTraffic([]traffic.Record{
+			{Minute: minute, Class: traffic.Observed, App: "Safari", Host: "example.com", Upload: int64(index + 1), Download: 10},
+			{Minute: minute, Class: traffic.Residual, Upload: 2, Download: 3},
+			{Minute: minute, Class: traffic.GapRecovered, Upload: 4, Download: 5},
+		}); err != nil {
+			t.Fatalf("seed minute %d: %v", index, err)
+		}
+	}
+
+	result, err := store.Series(storage.SeriesOptions{
+		Start:       time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC),
+		End:         time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC),
+		Granularity: storage.GranularityHour,
+		Location:    zone,
+	})
+	if err != nil {
+		t.Fatalf("query hourly series: %v", err)
+	}
+	if result.Granularity != storage.GranularityHour || len(result.Points) != 4 {
+		t.Fatalf("hourly series = %+v", result)
+	}
+	wantStarts := []string{
+		"2026-11-01T00:00:00-04:00",
+		"2026-11-01T01:00:00-04:00",
+		"2026-11-01T01:00:00-05:00",
+		"2026-11-01T02:00:00-05:00",
+	}
+	wantTotals := []int64{25, 26, 27, 28}
+	for index, point := range result.Points {
+		if got := point.Start.Format(time.RFC3339); got != wantStarts[index] {
+			t.Fatalf("point %d start = %s, want %s", index, got, wantStarts[index])
+		}
+		if point.Upload.Total != point.Upload.Observed+point.Upload.Residual+point.Upload.GapRecovered || point.Download.Total != point.Download.Observed+point.Download.Residual+point.Download.GapRecovered || point.Total.Total != point.Total.Observed+point.Total.Residual+point.Total.GapRecovered {
+			t.Fatalf("point %d total identity failed: %+v", index, point)
+		}
+		if point.Total.Total != wantTotals[index] {
+			t.Fatalf("point %d total = %d, want %d", index, point.Total.Total, wantTotals[index])
+		}
+	}
+}
+
+func TestSeriesAlignsDayBucketsAcrossDaylightSavingTransitions(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	zone, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load test time zone: %v", err)
+	}
+	minutes := []time.Time{
+		time.Date(2026, 3, 8, 4, 30, 0, 0, time.UTC),
+		time.Date(2026, 3, 8, 5, 30, 0, 0, time.UTC),
+		time.Date(2026, 3, 9, 3, 30, 0, 0, time.UTC),
+		time.Date(2026, 3, 9, 4, 30, 0, 0, time.UTC),
+	}
+	for _, minute := range minutes {
+		if err := store.AddTraffic([]traffic.Record{{Minute: minute, Class: traffic.Residual, Upload: 1, Download: 2}}); err != nil {
+			t.Fatalf("seed day traffic: %v", err)
+		}
+	}
+	result, err := store.Series(storage.SeriesOptions{
+		Start:       time.Date(2026, 3, 8, 4, 0, 0, 0, time.UTC),
+		End:         time.Date(2026, 3, 9, 5, 0, 0, 0, time.UTC),
+		Granularity: storage.GranularityDay,
+		Location:    zone,
+	})
+	if err != nil {
+		t.Fatalf("query daily series: %v", err)
+	}
+	wantStarts := []string{
+		"2026-03-07T00:00:00-05:00",
+		"2026-03-08T00:00:00-05:00",
+		"2026-03-09T00:00:00-04:00",
+	}
+	wantTotals := []int64{3, 6, 3}
+	if result.Granularity != storage.GranularityDay || len(result.Points) != len(wantStarts) {
+		t.Fatalf("daily series = %+v", result)
+	}
+	for index, point := range result.Points {
+		if got := point.Start.Format(time.RFC3339); got != wantStarts[index] || point.Total.Total != wantTotals[index] {
+			t.Fatalf("point %d = %s total %d, want %s total %d", index, got, point.Total.Total, wantStarts[index], wantTotals[index])
+		}
+	}
+}
+
+func TestSeriesAlignsHoursAcrossHalfHourDaylightSavingTransitions(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	zone, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatalf("load test time zone: %v", err)
+	}
+	minutes := []time.Time{
+		time.Date(2026, 4, 4, 14, 45, 0, 0, time.UTC),
+		time.Date(2026, 4, 4, 15, 15, 0, 0, time.UTC),
+		time.Date(2026, 10, 3, 15, 45, 0, 0, time.UTC),
+	}
+	for _, minute := range minutes {
+		if err := store.AddTraffic([]traffic.Record{{Minute: minute, Class: traffic.Residual, Upload: 1}}); err != nil {
+			t.Fatalf("seed half-hour transition traffic: %v", err)
+		}
+	}
+	result, err := store.Series(storage.SeriesOptions{
+		Start:       minutes[0].Add(-time.Minute),
+		End:         minutes[2].Add(time.Minute),
+		Granularity: storage.GranularityHour,
+		Location:    zone,
+	})
+	if err != nil {
+		t.Fatalf("query half-hour transition series: %v", err)
+	}
+	want := []string{
+		"2026-04-05T01:00:00+11:00",
+		"2026-04-05T01:30:00+10:30",
+		"2026-10-04T02:30:00+11:00",
+	}
+	if len(result.Points) != len(want) {
+		t.Fatalf("half-hour transition points = %+v", result.Points)
+	}
+	for index, point := range result.Points {
+		if got := point.Start.Format(time.RFC3339); got != want[index] {
+			t.Fatalf("half-hour point %d = %s, want %s", index, got, want[index])
+		}
+	}
+}
+
+func TestSeriesUsesTheFirstValidInstantOfADayWhenMidnightIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	zone, err := time.LoadLocation("America/Sao_Paulo")
+	if err != nil {
+		t.Fatalf("load test time zone: %v", err)
+	}
+	minute := time.Date(2018, 11, 4, 3, 30, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{{Minute: minute, Class: traffic.Residual, Download: 1}}); err != nil {
+		t.Fatalf("seed midnight transition traffic: %v", err)
+	}
+	result, err := store.Series(storage.SeriesOptions{Start: minute.Add(-time.Minute), End: minute.Add(time.Minute), Granularity: storage.GranularityDay, Location: zone})
+	if err != nil {
+		t.Fatalf("query midnight transition series: %v", err)
+	}
+	if len(result.Points) != 1 || result.Points[0].Start.Format(time.RFC3339) != "2018-11-04T01:00:00-02:00" {
+		t.Fatalf("midnight transition point = %+v", result.Points)
+	}
+}
+
+func TestMigrationPreservesPopulatedVersionTwoMinuteHistory(t *testing.T) {
+	t.Parallel()
+
+	dataDirectory := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDirectory, 0o700); err != nil {
+		t.Fatalf("create version two data directory: %v", err)
+	}
+	databasePath := filepath.Join(dataDirectory, "traffic.db")
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open version two fixture: %v", err)
+	}
+	minute := time.Date(2019, 6, 7, 8, 9, 0, 0, time.UTC)
+	if _, err := database.Exec(`
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+		INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2019-01-01T00:00:00Z'), (2, '2019-01-01T00:00:01Z');
+		CREATE TABLE apps (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+		CREATE TABLE endpoints (id INTEGER PRIMARY KEY, host TEXT NOT NULL, registrable_domain TEXT NOT NULL DEFAULT '', UNIQUE(host, registrable_domain));
+		CREATE TABLE minute_traffic (
+			minute INTEGER NOT NULL,
+			attribution_class TEXT NOT NULL,
+			app_id INTEGER REFERENCES apps(id),
+			endpoint_id INTEGER REFERENCES endpoints(id),
+			upload_bytes INTEGER NOT NULL,
+			download_bytes INTEGER NOT NULL
+		);
+		INSERT INTO minute_traffic(minute, attribution_class, upload_bytes, download_bytes)
+		VALUES (?, 'residual', 7, 11);
+	`, minute.Unix()); err != nil {
+		_ = database.Close()
+		t.Fatalf("create populated version two fixture: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version two fixture: %v", err)
+	}
+	if err := os.Chmod(databasePath, 0o600); err != nil {
+		t.Fatalf("secure version two fixture: %v", err)
+	}
+
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("migrate populated version two database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if store.Info().SchemaVersion != 3 {
+		t.Fatalf("migrated schema version = %d, want 3", store.Info().SchemaVersion)
+	}
+	series, err := store.Series(storage.SeriesOptions{Start: minute, End: minute.Add(time.Minute), Granularity: storage.GranularityMinute, Location: time.UTC})
+	if err != nil {
+		t.Fatalf("query migrated minute history: %v", err)
+	}
+	if len(series.Points) != 1 || series.Points[0].Upload.Total != 7 || series.Points[0].Download.Total != 11 || series.Points[0].Total.Total != 18 {
+		t.Fatalf("migrated minute history = %+v", series.Points)
+	}
+}
+
+func TestSeriesAutoBoundsPointsWithoutChangingPermanentMinuteHistory(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2020, 1, 2, 3, 0, 0, 0, time.UTC)
+	records := make([]traffic.Record, 0, storage.AutoPointLimit+1)
+	for index := 0; index <= storage.AutoPointLimit; index++ {
+		records = append(records, traffic.Record{Minute: start.Add(time.Duration(index) * time.Minute), Class: traffic.Residual, Upload: 1, Download: 2})
+	}
+	if err := store.AddTraffic(records); err != nil {
+		t.Fatalf("seed permanent minute history: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close permanent history database: %v", err)
+	}
+	store, err = storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen permanent history database: %v", err)
+	}
+	end := start.Add(time.Duration(storage.AutoPointLimit+1) * time.Minute)
+	automatic, err := store.Series(storage.SeriesOptions{Start: start, End: end, Granularity: storage.GranularityAuto, Location: time.UTC})
+	if err != nil {
+		t.Fatalf("query automatic series: %v", err)
+	}
+	if automatic.Granularity != storage.GranularityHour || len(automatic.Points) > storage.AutoPointLimit {
+		t.Fatalf("automatic series = granularity %q, points %d", automatic.Granularity, len(automatic.Points))
+	}
+	minuteSeries, err := store.Series(storage.SeriesOptions{Start: start, End: end, Granularity: storage.GranularityMinute, Location: time.UTC})
+	if err != nil {
+		t.Fatalf("query minute series: %v", err)
+	}
+	if len(minuteSeries.Points) != storage.AutoPointLimit+1 {
+		t.Fatalf("minute points = %d, want %d", len(minuteSeries.Points), storage.AutoPointLimit+1)
+	}
+	summary, err := store.Summary(start, end)
+	if err != nil {
+		t.Fatalf("query permanent history summary: %v", err)
+	}
+	if summary.Upload.Total != 401 || summary.Download.Total != 802 || summary.Total.Total != 1_203 {
+		t.Fatalf("permanent history changed after rollups: %+v", summary)
+	}
+}
+
+func TestSeriesAutoReportsWhenDailyHistoryExceedsThePointLimit(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2018, 1, 1, 12, 0, 0, 0, time.UTC)
+	records := make([]traffic.Record, 0, storage.AutoPointLimit+1)
+	for index := 0; index <= storage.AutoPointLimit; index++ {
+		records = append(records, traffic.Record{Minute: start.AddDate(0, 0, index), Class: traffic.Residual, Upload: 1})
+	}
+	if err := store.AddTraffic(records); err != nil {
+		t.Fatalf("seed daily history: %v", err)
+	}
+
+	_, err = store.Series(storage.SeriesOptions{
+		Start:       start,
+		End:         start.AddDate(0, 0, storage.AutoPointLimit+1),
+		Granularity: storage.GranularityAuto,
+		Location:    time.UTC,
+	})
+	if !errors.Is(err, storage.ErrAutoPointLimitExceeded) {
+		t.Fatalf("automatic oversized series error = %v", err)
+	}
+}
+
+func TestSeriesReadsContinueWhileWALCollectionWrites(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{{Minute: start, Class: traffic.Residual, Upload: 1, Download: 2}}); err != nil {
+		t.Fatalf("seed traffic: %v", err)
+	}
+
+	var writers sync.WaitGroup
+	writers.Add(1)
+	writeErrors := make(chan error, 1)
+	go func() {
+		defer writers.Done()
+		for index := 1; index <= 40; index++ {
+			if err := store.AddTraffic([]traffic.Record{{Minute: start.Add(time.Duration(index) * time.Minute), Class: traffic.Residual, Upload: 1, Download: 2}}); err != nil {
+				writeErrors <- err
+				return
+			}
+		}
+	}()
+
+	for index := 0; index < 40; index++ {
+		series, err := store.Series(storage.SeriesOptions{Start: start, End: start.Add(time.Hour), Granularity: storage.GranularityMinute, Location: time.UTC})
+		if err != nil {
+			t.Fatalf("read series during collection: %v", err)
+		}
+		for _, point := range series.Points {
+			if point.Total.Total != 3 {
+				t.Fatalf("read partial traffic transaction: %+v", point)
+			}
+		}
+	}
+	writers.Wait()
+	select {
+	case err := <-writeErrors:
+		t.Fatalf("collect traffic concurrently: %v", err)
+	default:
+	}
+	series, err := store.Series(storage.SeriesOptions{Start: start, End: start.Add(time.Hour), Granularity: storage.GranularityMinute, Location: time.UTC})
+	if err != nil {
+		t.Fatalf("read final series: %v", err)
+	}
+	if len(series.Points) != 41 {
+		t.Fatalf("final series points = %d, want 41", len(series.Points))
 	}
 }
 
