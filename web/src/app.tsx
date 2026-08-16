@@ -78,6 +78,33 @@ interface SummaryResponse {
   leaders: { apps: Leader[]; hosts: Leader[] };
 }
 
+type Direction = "upload" | "download" | "total";
+type Granularity = "minute" | "hour" | "day" | "auto";
+
+interface SeriesPoint {
+  start: string;
+  upload: AttributionTotals;
+  download: AttributionTotals;
+  total: AttributionTotals;
+}
+
+interface SeriesResponse {
+  apiVersion: string;
+  granularity: Exclude<Granularity, "auto">;
+  pointLimit: number;
+  timeZone: string;
+  range: { from: string; to: string };
+  points: SeriesPoint[];
+}
+
+interface AnalyzeQuery {
+  from: string;
+  to: string;
+  timeZone: string;
+  direction: Direction;
+  granularity: Granularity;
+}
+
 const routes: Array<{ path: Route; label: string }> = [
   { path: "/", label: "Overview" },
   { path: "/analyze", label: "Analyze" },
@@ -169,6 +196,7 @@ export function App() {
   }, []);
 
   const navigate = (path: Route) => {
+    if (path === route) return;
     window.history.pushState({}, "", path);
     setRoute(path);
   };
@@ -314,14 +342,166 @@ function TrafficTrace({ history, upload, download }: { history: RatePoint[]; upl
 }
 
 function Analyze() {
+  const [query, setQuery] = useState<AnalyzeQuery>(() => readAnalyzeQuery());
+  const [draftFrom, setDraftFrom] = useState(() => toDateTimeInZone(query.from, query.timeZone));
+  const [draftTo, setDraftTo] = useState(() => toDateTimeInZone(query.to, query.timeZone));
+  const [series, setSeries] = useState<SeriesResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [formError, setFormError] = useState("");
+
+  const commitQuery = (next: AnalyzeQuery, mode: "push" | "replace" = "push") => {
+    const url = `/analyze?${serializeAnalyzeQuery(next).toString()}`;
+    window.history[mode === "push" ? "pushState" : "replaceState"]({}, "", url);
+    setQuery(next);
+  };
+
+  useEffect(() => {
+    commitQuery(query, "replace");
+  }, []);
+
+  useEffect(() => {
+    const restore = () => setQuery(readAnalyzeQuery());
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
+  useEffect(() => {
+    setDraftFrom(toDateTimeInZone(query.from, query.timeZone));
+    setDraftTo(toDateTimeInZone(query.to, query.timeZone));
+  }, [query.from, query.to, query.timeZone]);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const apiQuery = new URLSearchParams({
+      from: query.from,
+      to: query.to,
+      timeZone: query.timeZone,
+      granularity: query.granularity,
+    });
+    setLoading(true);
+    setError("");
+    fetch(`/api/v1/series?${apiQuery.toString()}`, { signal: abort.signal })
+      .then(async (response) => {
+        if (response.ok) return (await response.json()) as SeriesResponse;
+        const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+        throw new Error(payload?.error?.message ?? `History request failed (${response.status})`);
+      })
+      .then((nextSeries) => setSeries(nextSeries))
+      .catch((reason: unknown) => {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        setSeries(null);
+        setError(reason instanceof Error ? reason.message : "Traffic history is unavailable");
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setLoading(false);
+      });
+    return () => abort.abort();
+  }, [query.from, query.to, query.timeZone, query.granularity]);
+
+  const applyRange = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const from = draftFrom === toDateTimeInZone(query.from, query.timeZone) ? new Date(query.from) : zonedDateTimeToInstant(draftFrom, query.timeZone);
+    const to = draftTo === toDateTimeInZone(query.to, query.timeZone) ? new Date(query.to) : zonedDateTimeToInstant(draftTo, query.timeZone);
+    if (from === null || to === null || to <= from) {
+      setFormError("Choose a valid range with To later than From.");
+      return;
+    }
+    setFormError("");
+    commitQuery({ ...query, from: from.toISOString(), to: to.toISOString() });
+  };
+
+  const setDirection = (direction: Direction) => commitQuery({ ...query, direction });
+  const setGranularity = (granularity: Granularity) => commitQuery({ ...query, granularity });
+
   return (
-    <section className="empty-page">
-      <p className="eyebrow">Historical analysis</p>
-      <h1>No traffic history yet</h1>
-      <p>App, Host, and Registrable domain trends will appear after the collector stores its first complete minute.</p>
-      <div className="empty-ruler" aria-hidden="true"><span /><span /><span /><span /><span /></div>
+    <section className="analyze-page">
+      <header className="analyze-heading">
+        <div>
+          <p className="eyebrow">Permanent minute history</p>
+          <h1>Traffic history</h1>
+        </div>
+        <p>{query.timeZone}<span>{series ? `${series.granularity} buckets / ${series.points.length} points` : "Local calendar buckets"}</span></p>
+      </header>
+
+      <form className="analyze-controls" onSubmit={applyRange}>
+        <label htmlFor="analyze-from">From<input id="analyze-from" name="from" type="datetime-local" value={draftFrom} onChange={(event) => setDraftFrom(event.target.value)} /></label>
+        <label htmlFor="analyze-to">To<input id="analyze-to" name="to" type="datetime-local" value={draftTo} onChange={(event) => setDraftTo(event.target.value)} /></label>
+        <label htmlFor="analyze-granularity">Granularity
+          <select id="analyze-granularity" name="granularity" value={query.granularity} onChange={(event) => setGranularity(event.target.value as Granularity)}>
+            <option value="auto">Auto / max 400</option>
+            <option value="minute">Minute</option>
+            <option value="hour">Hour</option>
+            <option value="day">Day</option>
+          </select>
+        </label>
+        <fieldset className="direction-control">
+          <legend>Direction</legend>
+          {(["upload", "download", "total"] as const).map((direction) => (
+            <label key={direction} className={`direction-${direction}`}>
+              <input type="radio" name="direction" value={direction} checked={query.direction === direction} onChange={() => setDirection(direction)} />
+              <span>{direction[0].toUpperCase() + direction.slice(1)}</span>
+            </label>
+          ))}
+        </fieldset>
+        <button type="submit">Apply range</button>
+        {formError ? <p className="control-error" role="alert">{formError}</p> : null}
+      </form>
+
+      <div className="analysis-stage">
+        {loading ? <AnalysisState heading="Reading traffic history" detail="Querying the permanent local minute store." /> : error ? <AnalysisState heading="History could not be read" detail={error} alert /> : series && series.points.length > 0 ? (
+          <>
+            <HistoricalTrend series={series} direction={query.direction} />
+            <TrafficPointTable series={series} direction={query.direction} />
+          </>
+        ) : <AnalysisState heading="No traffic in this range" detail="Choose a wider range or wait until the collector stores a complete minute." />}
+      </div>
     </section>
   );
+}
+
+function HistoricalTrend({ series, direction }: { series: SeriesResponse; direction: Direction }) {
+  const values = series.points.map((point) => point[direction].total);
+  const peak = Math.max(1, ...values);
+  const x = (index: number) => series.points.length === 1 ? 450 : 30 + (index / (series.points.length - 1)) * 840;
+  const y = (value: number) => 250 - (value / peak) * 205;
+  const polyline = values.map((value, index) => `${x(index)},${y(value)}`).join(" ");
+  const selectedTotal = values.reduce((total, value) => total + value, 0);
+  const label = `${humanizeReason(direction)} traffic trend, ${series.points.length} points, ${formatBytes(selectedTotal)} in the selected range`;
+  return (
+    <section className={`historical-trend trend-${direction}`}>
+      <div className="trend-readout"><span>{humanizeReason(direction)} / selected range</span><strong>{formatBytes(selectedTotal)}</strong><small>Peak {formatBytes(peak)} per {series.granularity}</small></div>
+      <svg viewBox="0 0 900 280" preserveAspectRatio="none" role="img" aria-label={label}>
+        <line x1="0" y1="250" x2="900" y2="250" className="history-axis" />
+        <line x1="0" y1="148" x2="900" y2="148" className="history-gridline" />
+        <line x1="0" y1="45" x2="900" y2="45" className="history-gridline" />
+        <polyline points={polyline} className="history-line" />
+        {values.map((value, index) => <circle key={series.points[index].start} cx={x(index)} cy={y(value)} r="3.5" className="history-point" />)}
+      </svg>
+      <div className="trend-range"><span>{formatSeriesTime(series.range.from, series.timeZone)}</span><span>{formatSeriesTime(series.range.to, series.timeZone)}</span></div>
+    </section>
+  );
+}
+
+function TrafficPointTable({ series, direction }: { series: SeriesResponse; direction: Direction }) {
+  return (
+    <div className="point-table-wrap">
+      <table className="point-table">
+        <caption>{humanizeReason(direction)} attribution by {series.granularity}</caption>
+        <thead><tr><th scope="col">Bucket</th><th scope="col">Observed</th><th scope="col">Residual</th><th scope="col">Gap-recovered</th><th scope="col">Total</th></tr></thead>
+        <tbody>
+          {series.points.map((point) => {
+            const totals = point[direction];
+            return <tr key={point.start}><th scope="row">{formatSeriesTime(point.start, series.timeZone)}</th><td>{formatBytes(totals.observed)}</td><td>{formatBytes(totals.residual)}</td><td>{formatBytes(totals.gapRecovered)}</td><td>{formatBytes(totals.total)}</td></tr>;
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AnalysisState({ heading, detail, alert = false }: { heading: string; detail: string; alert?: boolean }) {
+  return <div className="analysis-state" role={alert ? "alert" : "status"}><span aria-hidden="true" /><h2>{heading}</h2><p>{detail}</p></div>;
 }
 
 function Status({ status }: { status: StatusResponse | null }) {
@@ -409,6 +589,99 @@ function formatRate(bytesPerSecond: number): string {
 
 function formatCoverage(coverage: number): string {
   return `${(coverage * 100).toFixed(1)}%`;
+}
+
+function readAnalyzeQuery(): AnalyzeQuery {
+  const params = new URLSearchParams(window.location.search);
+  const now = new Date();
+  const defaultFrom = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const parsedFrom = new Date(params.get("from") ?? "");
+  const parsedTo = new Date(params.get("to") ?? "");
+  const validRange = Number.isFinite(parsedFrom.getTime()) && Number.isFinite(parsedTo.getTime()) && parsedTo > parsedFrom;
+  const requestedZone = params.get("timeZone") ?? browserTimeZone();
+  const direction = params.get("direction");
+  const granularity = params.get("granularity");
+  return {
+    from: (validRange ? parsedFrom : defaultFrom).toISOString(),
+    to: (validRange ? parsedTo : now).toISOString(),
+    timeZone: isTimeZone(requestedZone) ? requestedZone : browserTimeZone(),
+    direction: direction === "upload" || direction === "download" || direction === "total" ? direction : "total",
+    granularity: granularity === "minute" || granularity === "hour" || granularity === "day" || granularity === "auto" ? granularity : "auto",
+  };
+}
+
+function serializeAnalyzeQuery(query: AnalyzeQuery): URLSearchParams {
+  return new URLSearchParams({
+    from: query.from,
+    to: query.to,
+    timeZone: query.timeZone,
+    direction: query.direction,
+    granularity: query.granularity,
+  });
+}
+
+function browserTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function isTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function toDateTimeInZone(value: string, timeZone: string): string {
+  const parts = zonedParts(new Date(value), timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+
+function zonedDateTimeToInstant(value: string, timeZone: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const requested = {
+    year: match[1], month: match[2], day: match[3], hour: match[4], minute: match[5],
+  };
+  const wallClockUTC = Date.UTC(Number(requested.year), Number(requested.month) - 1, Number(requested.day), Number(requested.hour), Number(requested.minute));
+  let candidate = new Date(wallClockUTC);
+  for (let iteration = 0; iteration < 2; iteration++) {
+    const parts = zonedParts(candidate, timeZone);
+    const representedUTC = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
+    candidate = new Date(candidate.getTime() + wallClockUTC - representedUTC);
+  }
+  const resolved = zonedParts(candidate, timeZone);
+  return Object.keys(requested).every((key) => requested[key as keyof typeof requested] === resolved[key as keyof typeof resolved]) ? candidate : null;
+}
+
+function zonedParts(date: Date, timeZone: string): Record<"year" | "month" | "day" | "hour" | "minute", string> {
+  const result = {} as Record<"year" | "month" | "day" | "hour" | "minute", string>;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  for (const part of parts) {
+    if (part.type === "year" || part.type === "month" || part.type === "day" || part.type === "hour" || part.type === "minute") result[part.type] = part.value;
+  }
+  return result;
+}
+
+function formatSeriesTime(value: string, timeZone: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(value));
 }
 
 function todaySummaryURL(): string {

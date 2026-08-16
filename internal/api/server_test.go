@@ -207,6 +207,171 @@ func TestSummaryReturnsHalfOpenAttributionTotalsCoverageAndLeaders(t *testing.T)
 	}
 }
 
+func TestSummaryAcceptsCanonicalFromToAndRetainsStartEndCompatibility(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	minute := time.Date(2026, 8, 14, 2, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{{Minute: minute, Class: traffic.Residual, Upload: 4, Download: 6}}); err != nil {
+		t.Fatalf("seed summary traffic: %v", err)
+	}
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	for _, query := range []string{
+		"from=" + url.QueryEscape(minute.Format(time.RFC3339)) + "&to=" + url.QueryEscape(minute.Add(time.Minute).Format(time.RFC3339)),
+		"start=" + url.QueryEscape(minute.Format(time.RFC3339)) + "&end=" + url.QueryEscape(minute.Add(time.Minute).Format(time.RFC3339)),
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/summary?"+query, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("summary query %q status = %d: %s", query, response.Code, response.Body.String())
+		}
+		var payload struct {
+			Total storage.AttributionTotals `json:"total"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode summary: %v", err)
+		}
+		if payload.Total.Total != 10 {
+			t.Fatalf("summary query %q total = %+v", query, payload.Total)
+		}
+	}
+}
+
+func TestSeriesReturnsCalendarBucketsAndDirectionalAttributionTotals(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	first := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)
+	second := time.Date(2026, 11, 1, 6, 30, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: first, Class: traffic.Observed, App: "Safari", Host: "example.com", Upload: 10, Download: 20},
+		{Minute: first, Class: traffic.Residual, Upload: 3, Download: 4},
+		{Minute: second, Class: traffic.GapRecovered, Upload: 5, Download: 6},
+	}); err != nil {
+		t.Fatalf("seed series traffic: %v", err)
+	}
+	from := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 1, 7, 0, 0, 0, time.UTC)
+	path := "/api/v1/series?from=" + url.QueryEscape(from.Format(time.RFC3339)) + "&to=" + url.QueryEscape(to.Format(time.RFC3339)) + "&timeZone=America%2FNew_York&granularity=hour"
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("series status = %d: %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		APIVersion  string              `json:"apiVersion"`
+		Granularity storage.Granularity `json:"granularity"`
+		PointLimit  int                 `json:"pointLimit"`
+		TimeZone    string              `json:"timeZone"`
+		Range       struct {
+			From string `json:"from"`
+			To   string `json:"to"`
+		} `json:"range"`
+		Points []struct {
+			Start    string                    `json:"start"`
+			Upload   storage.AttributionTotals `json:"upload"`
+			Download storage.AttributionTotals `json:"download"`
+			Total    storage.AttributionTotals `json:"total"`
+		} `json:"points"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode series: %v", err)
+	}
+	if payload.APIVersion != "v1" || payload.Granularity != storage.GranularityHour || payload.PointLimit != storage.AutoPointLimit || payload.TimeZone != "America/New_York" || payload.Range.From != from.Format(time.RFC3339) || payload.Range.To != to.Format(time.RFC3339) {
+		t.Fatalf("series metadata = %+v", payload)
+	}
+	if len(payload.Points) != 2 || payload.Points[0].Start != "2026-11-01T01:00:00-04:00" || payload.Points[1].Start != "2026-11-01T01:00:00-05:00" {
+		t.Fatalf("series points = %+v", payload.Points)
+	}
+	if payload.Points[0].Total != (storage.AttributionTotals{Observed: 30, Residual: 7, Total: 37}) || payload.Points[1].Total != (storage.AttributionTotals{GapRecovered: 11, Total: 11}) {
+		t.Fatalf("series totals = %+v", payload.Points)
+	}
+}
+
+func TestSeriesRejectsInvalidRangesTimeZonesAndGranularities(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	validRange := "from=2026-08-14T00%3A00%3A00Z&to=2026-08-14T01%3A00%3A00Z"
+	tests := []struct {
+		path string
+		code string
+	}{
+		{path: "/api/v1/series", code: "invalid_time_range"},
+		{path: "/api/v1/series?from=bad&to=2026-08-14T01%3A00%3A00Z&timeZone=UTC&granularity=auto", code: "invalid_time_range"},
+		{path: "/api/v1/series?from=2026-08-14T01%3A00%3A00Z&to=2026-08-14T01%3A00%3A00Z&timeZone=UTC&granularity=auto", code: "invalid_time_range"},
+		{path: "/api/v1/series?" + validRange + "&timeZone=Mars%2FOlympus&granularity=auto", code: "invalid_time_zone"},
+		{path: "/api/v1/series?" + validRange + "&timeZone=UTC&granularity=week", code: "invalid_granularity"},
+	}
+	for _, test := range tests {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+		var payload struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode %s error: %v", test.path, err)
+		}
+		if response.Code != http.StatusBadRequest || payload.Error.Code != test.code {
+			t.Fatalf("%s = status %d code %q, want 400 %q", test.path, response.Code, payload.Error.Code, test.code)
+		}
+	}
+}
+
+func TestSeriesReportsWhenAutoCannotFitTheDocumentedPointLimit(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	from := time.Date(2018, 1, 1, 12, 0, 0, 0, time.UTC)
+	records := make([]traffic.Record, 0, storage.AutoPointLimit+1)
+	for index := 0; index <= storage.AutoPointLimit; index++ {
+		records = append(records, traffic.Record{Minute: from.AddDate(0, 0, index), Class: traffic.Residual, Download: 1})
+	}
+	if err := store.AddTraffic(records); err != nil {
+		t.Fatalf("seed oversized daily history: %v", err)
+	}
+	to := from.AddDate(0, 0, storage.AutoPointLimit+1)
+	path := "/api/v1/series?from=" + url.QueryEscape(from.Format(time.RFC3339)) + "&to=" + url.QueryEscape(to.Format(time.RFC3339)) + "&timeZone=UTC&granularity=auto"
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode oversized series error: %v", err)
+	}
+	if response.Code != http.StatusUnprocessableEntity || payload.Error.Code != "series_point_limit_exceeded" {
+		t.Fatalf("oversized series = status %d code %q", response.Code, payload.Error.Code)
+	}
+}
+
 func TestSummaryRejectsMissingMalformedAndEmptyRanges(t *testing.T) {
 	t.Parallel()
 
@@ -281,6 +446,22 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 	if _, ok := paths["/api/v1/summary"]; !ok {
 		t.Fatal("OpenAPI is missing the traffic summary")
 	}
+	seriesPath, ok := paths["/api/v1/series"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI is missing the traffic series")
+	}
+	seriesOperation := seriesPath["get"].(map[string]any)
+	parameters := seriesOperation["parameters"].([]any)
+	parameterNames := map[string]bool{}
+	for _, rawParameter := range parameters {
+		parameter := rawParameter.(map[string]any)
+		parameterNames[parameter["name"].(string)] = true
+	}
+	for _, name := range []string{"from", "to", "timeZone", "granularity"} {
+		if !parameterNames[name] {
+			t.Fatalf("series OpenAPI is missing %q query parameter", name)
+		}
+	}
 	if _, ok := paths["/api/v1/gaps"]; !ok {
 		t.Fatal("OpenAPI is missing Collection gaps")
 	}
@@ -289,6 +470,15 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 	}
 	if _, ok := schemas["Summary"]; !ok {
 		t.Fatal("OpenAPI is missing the Summary schema")
+	}
+	seriesSchema, ok := schemas["Series"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI is missing the Series schema")
+	}
+	seriesProperties := seriesSchema["properties"].(map[string]any)
+	pointLimit := seriesProperties["pointLimit"].(map[string]any)
+	if pointLimit["const"] != float64(storage.AutoPointLimit) && pointLimit["const"] != storage.AutoPointLimit {
+		t.Fatalf("series pointLimit contract = %v, want %d", pointLimit["const"], storage.AutoPointLimit)
 	}
 
 	statusResponse := httptest.NewRecorder()

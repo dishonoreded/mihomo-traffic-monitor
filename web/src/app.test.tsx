@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { App } from "./app";
@@ -72,15 +72,44 @@ const summaryResponse = {
 	},
 };
 
+const emptySeriesResponse = {
+  apiVersion: "v1",
+  granularity: "minute",
+  pointLimit: 400,
+  timeZone: "UTC",
+  range: { from: "2026-08-13T12:00:00Z", to: "2026-08-14T12:00:00Z" },
+  points: [],
+};
+
+const seriesResponse = {
+  ...emptySeriesResponse,
+  granularity: "hour",
+  points: [
+    {
+      start: "2026-08-14T10:00:00Z",
+      upload: { observed: 1024, residual: 256, gapRecovered: 0, total: 1280 },
+      download: { observed: 2048, residual: 0, gapRecovered: 512, total: 2560 },
+      total: { observed: 3072, residual: 256, gapRecovered: 512, total: 3840 },
+    },
+    {
+      start: "2026-08-14T11:00:00Z",
+      upload: { observed: 2048, residual: 0, gapRecovered: 0, total: 2048 },
+      download: { observed: 4096, residual: 512, gapRecovered: 0, total: 4608 },
+      total: { observed: 6144, residual: 512, gapRecovered: 0, total: 6656 },
+    },
+  ],
+};
+
 function mockAPI() {
 	return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 		const path = String(input);
-		const payload = path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+		const payload = path.startsWith("/api/v1/summary?") ? summaryResponse : path.startsWith("/api/v1/series?") ? emptySeriesResponse : statusResponse;
 		return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 	});
 }
 
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   window.history.replaceState({}, "", "/");
@@ -101,7 +130,7 @@ test("user can inspect the unavailable local observatory and navigate its empty 
   expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
 
   await user.click(screen.getByRole("link", { name: "Analyze" }));
-  expect(screen.getByRole("heading", { name: "No traffic history yet" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "No traffic in this range" })).toBeVisible();
   expect(window.location.pathname).toBe("/analyze");
 
   await user.click(screen.getByRole("link", { name: "Status" }));
@@ -112,6 +141,71 @@ test("user can inspect the unavailable local observatory and navigate its empty 
   expect(screen.getByText(/Authentication failed/)).toBeVisible();
   expect(screen.getByText("Recovered 90 B")).toBeVisible();
   expect(screen.getByText("Upload 30 B · Download 60 B")).toBeVisible();
+});
+
+test("Analyze restores its URL and requests the exact local-zone series", async () => {
+  const query = "from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=download&granularity=hour";
+  window.history.replaceState({}, "", `/analyze?${query}`);
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    const payload = path.startsWith("/api/v1/series?") ? seriesResponse : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("heading", { name: "Traffic history" })).toBeVisible();
+  expect(screen.getByRole("img", { name: /Download traffic trend.*2 points/i })).toBeVisible();
+  expect(screen.getByRole("radio", { name: "Download" })).toBeChecked();
+  expect(screen.getByLabelText("From")).toHaveValue("2026-08-14T10:00");
+  expect(screen.getByLabelText("To")).toHaveValue("2026-08-14T12:00");
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/series?from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&granularity=hour", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+
+  await userEvent.click(screen.getByRole("link", { name: "Analyze" }));
+  expect(window.location.search).toBe(`?${query}`);
+});
+
+test("Analyze switches direction and applies a reproducible range", async () => {
+  window.history.replaceState({}, "", "/analyze?from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=upload&granularity=hour");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    const payload = path.startsWith("/api/v1/series?") ? seriesResponse : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200 });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  expect(await screen.findByRole("img", { name: /Upload traffic trend/i })).toBeVisible();
+
+  await user.click(screen.getByRole("radio", { name: "Total" }));
+  expect(screen.getByRole("img", { name: /Total traffic trend/i })).toBeVisible();
+  expect(new URLSearchParams(window.location.search).get("direction")).toBe("total");
+
+  fireEvent.change(screen.getByLabelText("From"), { target: { value: "2026-08-14T09:00" } });
+  await user.click(screen.getByRole("button", { name: "Apply range" }));
+  const params = new URLSearchParams(window.location.search);
+  expect(params.get("from")).toBe("2026-08-14T09:00:00.000Z");
+  expect(params.get("to")).toBe("2026-08-14T12:00:00.000Z");
+  expect(params.get("timeZone")).toBe("UTC");
+  expect(params.get("direction")).toBe("total");
+  expect(params.get("granularity")).toBe("hour");
+});
+
+test("Analyze preserves the selected DST-fold instant when the wall time is unchanged", async () => {
+  window.history.replaceState({}, "", "/analyze?from=2026-11-01T06%3A30%3A00.000Z&to=2026-11-01T08%3A00%3A00.000Z&timeZone=America%2FNew_York&direction=total&granularity=hour");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    const payload = path.startsWith("/api/v1/series?") ? { ...emptySeriesResponse, timeZone: "America/New_York", range: { from: "2026-11-01T06:30:00Z", to: "2026-11-01T08:00:00Z" } } : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200 });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByLabelText("From")).toHaveValue("2026-11-01T01:30");
+  await user.click(screen.getByRole("button", { name: "Apply range" }));
+
+  const params = new URLSearchParams(window.location.search);
+  expect(params.get("from")).toBe("2026-11-01T06:30:00.000Z");
+  expect(params.get("to")).toBe("2026-11-01T08:00:00.000Z");
 });
 
 test("live events drive the directional trace and current connection readouts", async () => {

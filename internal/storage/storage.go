@@ -2,9 +2,11 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
@@ -48,6 +50,42 @@ type TrafficSummary struct {
 	Coverage float64
 	Apps     []Leader
 	Hosts    []Leader
+}
+
+type Granularity string
+
+const (
+	GranularityMinute Granularity = "minute"
+	GranularityHour   Granularity = "hour"
+	GranularityDay    Granularity = "day"
+	GranularityAuto   Granularity = "auto"
+	AutoPointLimit                = 400
+)
+
+var ErrAutoPointLimitExceeded = errors.New("automatic series exceeds the point limit at day granularity")
+
+type SeriesOptions struct {
+	Start       time.Time
+	End         time.Time
+	Granularity Granularity
+	Location    *time.Location
+}
+
+type SeriesPoint struct {
+	Start    time.Time         `json:"start"`
+	Upload   AttributionTotals `json:"upload"`
+	Download AttributionTotals `json:"download"`
+	Total    AttributionTotals `json:"total"`
+}
+
+type TrafficSeries struct {
+	Granularity Granularity
+	Points      []SeriesPoint
+}
+
+type seriesCandidate struct {
+	points   map[time.Time]*SeriesPoint
+	exceeded bool
 }
 
 type leaderQuery struct {
@@ -551,9 +589,9 @@ func (store *Store) Summary(start, end time.Time) (TrafficSummary, error) {
 		if err := rows.Scan(&class, &upload, &download); err != nil {
 			return TrafficSummary{}, fmt.Errorf("scan traffic summary: %w", err)
 		}
-		applyClassTotals(&result.Upload, class, upload)
-		applyClassTotals(&result.Download, class, download)
-		applyClassTotals(&result.Total, class, upload+download)
+		addClassTotals(&result.Upload, class, upload)
+		addClassTotals(&result.Download, class, download)
+		addClassTotals(&result.Total, class, upload+download)
 	}
 	if err := rows.Err(); err != nil {
 		return TrafficSummary{}, fmt.Errorf("iterate traffic summary: %w", err)
@@ -575,14 +613,166 @@ func (store *Store) Summary(start, end time.Time) (TrafficSummary, error) {
 	return result, nil
 }
 
-func applyClassTotals(totals *AttributionTotals, class traffic.Class, value int64) {
+func (store *Store) Series(options SeriesOptions) (TrafficSeries, error) {
+	if !options.End.After(options.Start) {
+		return TrafficSeries{}, fmt.Errorf("series end must be after start")
+	}
+	if options.Location == nil {
+		return TrafficSeries{}, fmt.Errorf("series location is required")
+	}
+	if options.Granularity != GranularityMinute && options.Granularity != GranularityHour && options.Granularity != GranularityDay && options.Granularity != GranularityAuto {
+		return TrafficSeries{}, fmt.Errorf("unsupported series granularity %q", options.Granularity)
+	}
+	granularities := []Granularity{options.Granularity}
+	pointLimit := 0
+	if options.Granularity == GranularityAuto {
+		granularities = []Granularity{GranularityMinute, GranularityHour, GranularityDay}
+		pointLimit = AutoPointLimit
+	}
+	candidates := make(map[Granularity]*seriesCandidate, len(granularities))
+	for _, granularity := range granularities {
+		candidates[granularity] = &seriesCandidate{points: make(map[time.Time]*SeriesPoint)}
+	}
+	rows, err := store.database.Query(`
+		SELECT minute, attribution_class, SUM(upload_bytes), SUM(download_bytes)
+		FROM minute_traffic
+		WHERE minute >= ? AND minute < ?
+		GROUP BY minute, attribution_class
+		ORDER BY minute
+	`, unixCeiling(options.Start), unixCeiling(options.End))
+	if err != nil {
+		return TrafficSeries{}, fmt.Errorf("query traffic series: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var minute int64
+		var class traffic.Class
+		var upload int64
+		var download int64
+		if err := rows.Scan(&minute, &class, &upload, &download); err != nil {
+			return TrafficSeries{}, fmt.Errorf("scan traffic series: %w", err)
+		}
+		instant := time.Unix(minute, 0).UTC()
+		for _, granularity := range granularities {
+			candidate := candidates[granularity]
+			if candidate.exceeded {
+				continue
+			}
+			start := seriesBucket(instant, granularity, options.Location)
+			point := candidate.points[start]
+			if point == nil {
+				if pointLimit > 0 && len(candidate.points) == pointLimit {
+					candidate.points = nil
+					candidate.exceeded = true
+					continue
+				}
+				point = &SeriesPoint{Start: start}
+				candidate.points[start] = point
+			}
+			addClassTotals(&point.Upload, class, upload)
+			addClassTotals(&point.Download, class, download)
+			addClassTotals(&point.Total, class, upload+download)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return TrafficSeries{}, fmt.Errorf("iterate traffic series: %w", err)
+	}
+	selected := options.Granularity
+	if selected == GranularityAuto {
+		selected = ""
+		for _, granularity := range granularities {
+			if !candidates[granularity].exceeded {
+				selected = granularity
+				break
+			}
+		}
+		if selected == "" {
+			return TrafficSeries{}, ErrAutoPointLimitExceeded
+		}
+	}
+	pointsByStart := candidates[selected].points
+	result := TrafficSeries{Granularity: selected, Points: make([]SeriesPoint, 0, len(pointsByStart))}
+	for _, point := range pointsByStart {
+		finalizeTotals(&point.Upload)
+		finalizeTotals(&point.Download)
+		finalizeTotals(&point.Total)
+		result.Points = append(result.Points, *point)
+	}
+	sort.Slice(result.Points, func(left, right int) bool { return result.Points[left].Start.Before(result.Points[right].Start) })
+	return result, nil
+}
+
+func seriesBucket(instant time.Time, granularity Granularity, location *time.Location) time.Time {
+	local := instant.In(location)
+	switch granularity {
+	case GranularityMinute:
+		return local
+	case GranularityDay:
+		return calendarDayStart(instant, local, location)
+	default:
+		return calendarHourStart(instant, local, location)
+	}
+}
+
+func calendarHourStart(instant, local time.Time, location *time.Location) time.Time {
+	candidate := instant.Add(-time.Duration(local.Minute())*time.Minute - time.Duration(local.Second())*time.Second - time.Duration(local.Nanosecond()))
+	if sameCalendarHourSegment(candidate.In(location), local) {
+		return candidate.In(location)
+	}
+
+	low, high := candidate.Unix(), instant.Unix()
+	for low < high {
+		middle := low + (high-low)/2
+		if sameCalendarHourSegment(time.Unix(middle, 0).In(location), local) {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+	return time.Unix(low, 0).In(location)
+}
+
+func sameCalendarHourSegment(left, right time.Time) bool {
+	_, leftOffset := left.Zone()
+	_, rightOffset := right.Zone()
+	return left.Year() == right.Year() && left.Month() == right.Month() && left.Day() == right.Day() && left.Hour() == right.Hour() && leftOffset == rightOffset
+}
+
+func calendarDayStart(instant, local time.Time, location *time.Location) time.Time {
+	candidate := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	if sameCalendarDay(candidate.In(location), local) && !sameCalendarDay(candidate.Add(-time.Second).In(location), local) {
+		return candidate.In(location)
+	}
+
+	target := calendarDayNumber(local)
+	low, high := instant.Add(-48*time.Hour).Unix(), instant.Unix()
+	for low < high {
+		middle := low + (high-low)/2
+		if calendarDayNumber(time.Unix(middle, 0).In(location)) >= target {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+	return time.Unix(low, 0).In(location)
+}
+
+func sameCalendarDay(left, right time.Time) bool {
+	return left.Year() == right.Year() && left.Month() == right.Month() && left.Day() == right.Day()
+}
+
+func calendarDayNumber(value time.Time) int {
+	return value.Year()*10_000 + int(value.Month())*100 + value.Day()
+}
+
+func addClassTotals(totals *AttributionTotals, class traffic.Class, value int64) {
 	switch class {
 	case traffic.Observed:
-		totals.Observed = value
+		totals.Observed += value
 	case traffic.Residual:
-		totals.Residual = value
+		totals.Residual += value
 	case traffic.GapRecovered:
-		totals.GapRecovered = value
+		totals.GapRecovered += value
 	}
 }
 

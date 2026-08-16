@@ -3,6 +3,7 @@ package api
 func openAPISpecification() map[string]any {
 	statusReference := map[string]any{"$ref": "#/components/schemas/Status"}
 	summaryReference := map[string]any{"$ref": "#/components/schemas/Summary"}
+	seriesReference := map[string]any{"$ref": "#/components/schemas/Series"}
 	gapsReference := map[string]any{"$ref": "#/components/schemas/Gaps"}
 	timeParameter := func(name string) map[string]any {
 		return map[string]any{
@@ -35,13 +36,41 @@ func openAPISpecification() map[string]any {
 				"get": map[string]any{
 					"operationId": "getTrafficSummary",
 					"summary":     "Summarize permanent minute traffic in a half-open time range",
-					"parameters":  []any{timeParameter("start"), timeParameter("end")},
+					"parameters":  []any{timeParameter("from"), timeParameter("to")},
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Directional attribution totals, coverage, and current leaders",
 							"content":     map[string]any{"application/json": map[string]any{"schema": summaryReference}},
 						},
 						"400": map[string]any{"description": "Missing, malformed, or empty time range"},
+					},
+				},
+			},
+			"/api/v1/series": map[string]any{
+				"get": map[string]any{
+					"operationId": "getTrafficSeries",
+					"summary":     "Read calendar-aligned traffic points from permanent minute history",
+					"description": "The range is [from, to). Auto selects the finest minute, hour, or day granularity that returns at most 400 non-empty points without truncating traffic.",
+					"parameters": []any{
+						timeParameter("from"),
+						timeParameter("to"),
+						map[string]any{
+							"name": "timeZone", "in": "query", "required": true,
+							"description": "IANA time zone used to align hour and day buckets across daylight-saving transitions.",
+							"schema":      map[string]any{"type": "string", "example": "America/New_York"},
+						},
+						map[string]any{
+							"name": "granularity", "in": "query", "required": true,
+							"schema": map[string]any{"type": "string", "enum": []string{"minute", "hour", "day", "auto"}},
+						},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Directional attribution totals at the selected granularity",
+							"content":     map[string]any{"application/json": map[string]any{"schema": seriesReference}},
+						},
+						"400": map[string]any{"description": "Invalid range, IANA time zone, or granularity"},
+						"422": map[string]any{"description": "Auto cannot represent the range within 400 daily points"},
 					},
 				},
 			},
@@ -158,6 +187,35 @@ func openAPISpecification() map[string]any {
 								"hosts": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Leader"}},
 							},
 						},
+					},
+				},
+				"SeriesPoint": map[string]any{
+					"type":     "object",
+					"required": []string{"start", "upload", "download", "total"},
+					"properties": map[string]any{
+						"start":    map[string]any{"type": "string", "format": "date-time"},
+						"upload":   map[string]any{"$ref": "#/components/schemas/AttributionTotals"},
+						"download": map[string]any{"$ref": "#/components/schemas/AttributionTotals"},
+						"total":    map[string]any{"$ref": "#/components/schemas/AttributionTotals"},
+					},
+				},
+				"Series": map[string]any{
+					"type":     "object",
+					"required": []string{"apiVersion", "granularity", "pointLimit", "timeZone", "range", "points"},
+					"properties": map[string]any{
+						"apiVersion":  map[string]any{"type": "string", "const": "v1"},
+						"granularity": map[string]any{"type": "string", "enum": []string{"minute", "hour", "day"}},
+						"pointLimit":  map[string]any{"type": "integer", "const": 400},
+						"timeZone":    map[string]any{"type": "string"},
+						"range": map[string]any{
+							"type":     "object",
+							"required": []string{"from", "to"},
+							"properties": map[string]any{
+								"from": map[string]any{"type": "string", "format": "date-time"},
+								"to":   map[string]any{"type": "string", "format": "date-time"},
+							},
+						},
+						"points": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/SeriesPoint"}},
 					},
 				},
 				"Status": map[string]any{
