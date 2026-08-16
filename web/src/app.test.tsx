@@ -193,6 +193,27 @@ test("Analyze adds and removes exact retained dimension filters", async () => {
   expect(new URLSearchParams(window.location.search).getAll("app")).toEqual([]);
 });
 
+test("Analyze does not leave stale rankings interactive while a filtered query loads", async () => {
+  window.history.replaceState({}, "", "/analyze?from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=total&granularity=hour");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input);
+    if (path.startsWith("/api/v1/rankings?") && path.includes("app=Mail")) {
+      return await new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError"))));
+    }
+    const payload = path.startsWith("/api/v1/series?") ? seriesResponse : path.startsWith("/api/v1/dimensions?") ? dimensionsResponse : path.startsWith("/api/v1/rankings?") ? rankingsResponse : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200 });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: /Filter App Mail.*120 B/i })).toBeVisible();
+  await user.type(screen.getByRole("combobox", { name: "App filter" }), "Mail");
+  await user.click(screen.getByRole("button", { name: "Add App filter" }));
+
+  expect((await screen.findAllByText("Reading observed traffic")).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("button", { name: /Filter App Mail.*120 B/i })).not.toBeInTheDocument();
+});
+
 test("user can inspect the unavailable local observatory and navigate its empty states", async () => {
   mockAPI();
   const user = userEvent.setup();

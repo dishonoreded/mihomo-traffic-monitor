@@ -376,7 +376,9 @@ function Analyze() {
   const [error, setError] = useState("");
   const [formError, setFormError] = useState("");
   const [dimensions, setDimensions] = useState<DimensionsResponse>({ apiVersion: "v1", query: "", limit: 100, apps: [], hosts: [], domains: [] });
+  const [dimensionsError, setDimensionsError] = useState("");
   const [rankings, setRankings] = useState<Record<FilterDimension, RankingsResponse | null>>({ app: null, host: null, domain: null });
+  const [rankingsLoading, setRankingsLoading] = useState(true);
   const [rankingsError, setRankingsError] = useState("");
   const [filterDrafts, setFilterDrafts] = useState<Record<FilterDimension, string>>({ app: "", host: "", domain: "" });
   const [focusAfterDrill, setFocusAfterDrill] = useState(false);
@@ -410,9 +412,12 @@ function Analyze() {
         if (!response.ok) throw new Error(`Dimensions request failed (${response.status})`);
         return (await response.json()) as DimensionsResponse;
       })
-      .then(setDimensions)
+      .then((result) => {
+        setDimensions(result);
+        setDimensionsError("");
+      })
       .catch((reason: unknown) => {
-        if (!(reason instanceof DOMException && reason.name === "AbortError")) setRankingsError(reason instanceof Error ? reason.message : "Traffic dimensions are unavailable");
+        if (!(reason instanceof DOMException && reason.name === "AbortError")) setDimensionsError(reason instanceof Error ? reason.message : "Traffic dimensions are unavailable");
       });
     return () => abort.abort();
   }, []);
@@ -450,6 +455,8 @@ function Analyze() {
     const abort = new AbortController();
     const base = new URLSearchParams({ from: query.from, to: query.to, direction: query.direction, limit: "10" });
     appendTrafficFilters(base, query);
+    setRankings({ app: null, host: null, domain: null });
+    setRankingsLoading(true);
     setRankingsError("");
     Promise.all((["app", "host", "domain"] as const).map(async (dimension) => {
       const parameters = new URLSearchParams(base);
@@ -461,6 +468,9 @@ function Analyze() {
       .then((results) => setRankings({ app: results[0], host: results[1], domain: results[2] }))
       .catch((reason: unknown) => {
         if (!(reason instanceof DOMException && reason.name === "AbortError")) setRankingsError(reason instanceof Error ? reason.message : "Traffic rankings are unavailable");
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setRankingsLoading(false);
       });
     return () => abort.abort();
   }, [query.from, query.to, query.direction, query.apps, query.hosts, query.domains]);
@@ -543,6 +553,7 @@ function Analyze() {
       <TrafficFilters
         query={query}
         dimensions={dimensions}
+        error={dimensionsError}
         drafts={filterDrafts}
         setDraft={(dimension, value) => setFilterDrafts((current) => ({ ...current, [dimension]: value }))}
         add={addFilter}
@@ -559,14 +570,15 @@ function Analyze() {
           </>
         ) : <AnalysisState heading="No traffic in this range" detail="Choose a wider range or wait until the collector stores a complete minute." />}
       </div>
-      <TrafficRankings rankings={rankings} direction={query.direction} error={rankingsError} selected={query} drillDown={drillDown} />
+      <TrafficRankings rankings={rankings} loading={rankingsLoading} direction={query.direction} error={rankingsError} selected={query} drillDown={drillDown} />
     </section>
   );
 }
 
-function TrafficFilters({ query, dimensions, drafts, setDraft, add, remove }: {
+function TrafficFilters({ query, dimensions, error, drafts, setDraft, add, remove }: {
   query: AnalyzeQuery;
   dimensions: DimensionsResponse;
+  error: string;
   drafts: Record<FilterDimension, string>;
   setDraft: (dimension: FilterDimension, value: string) => void;
   add: (dimension: FilterDimension) => void;
@@ -596,12 +608,14 @@ function TrafficFilters({ query, dimensions, drafts, setDraft, add, remove }: {
           </button>
         )))}
       </div>
+      {error ? <p className="filter-error" role="alert">{error}</p> : null}
     </section>
   );
 }
 
-function TrafficRankings({ rankings, direction, error, selected, drillDown }: {
+function TrafficRankings({ rankings, loading, direction, error, selected, drillDown }: {
   rankings: Record<FilterDimension, RankingsResponse | null>;
+  loading: boolean;
   direction: Direction;
   error: string;
   selected: AnalyzeQuery;
@@ -616,7 +630,7 @@ function TrafficRankings({ rankings, direction, error, selected, drillDown }: {
           const items = rankings[dimension]?.items ?? [];
           return <section className="ranking-list" aria-label={`${dimensionLabel(dimension)} rankings`} key={dimension}>
             <h3>{dimensionLabel(dimension)}s</h3>
-            {rankings[dimension] && items.length === 0 ? <p>No matching observed traffic</p> : (
+            {loading ? <p>Reading observed traffic</p> : rankings[dimension] && items.length === 0 ? <p>No matching observed traffic</p> : (
               <ol>{items.map((item, index) => {
                 const active = selected[analyzeFilterKey(dimension)].includes(item.name);
                 return <li key={item.name}><button type="button" disabled={active} onClick={() => drillDown(dimension, item.name)} aria-label={`Filter ${dimensionLabel(dimension)} ${item.name}, ${formatBytes(item[direction])}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name}</strong><b>{formatBytes(item[direction])}</b></button></li>;

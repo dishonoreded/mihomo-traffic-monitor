@@ -650,11 +650,11 @@ func (store *Store) FilteredSummary(start, end time.Time, filter TrafficFilter) 
 	if result.Total.Total > 0 {
 		result.Coverage = float64(result.Total.Observed) / float64(result.Total.Total)
 	}
-	result.Apps, err = store.dimensionLeaders(start, end, DimensionApp, 5, filter)
+	result.Apps, err = store.dimensionLeaders(start, end, DimensionApp, DirectionTotal, 5, filter)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
-	result.Hosts, err = store.dimensionLeaders(start, end, DimensionHost, 5, filter)
+	result.Hosts, err = store.dimensionLeaders(start, end, DimensionHost, DirectionTotal, 5, filter)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
@@ -929,14 +929,14 @@ func (store *Store) Rankings(options RankingOptions) (TrafficRankings, error) {
 	if options.Direction != DirectionUpload && options.Direction != DirectionDownload && options.Direction != DirectionTotal {
 		return TrafficRankings{}, fmt.Errorf("unsupported ranking direction %q", options.Direction)
 	}
-	items, err := store.dimensionLeaders(options.Start, options.End, options.Dimension, options.Limit, options.Filter, options.Direction)
+	items, err := store.dimensionLeaders(options.Start, options.End, options.Dimension, options.Direction, options.Limit, options.Filter)
 	if err != nil {
 		return TrafficRankings{}, err
 	}
 	return TrafficRankings{Scope: ScopeObserved, Dimension: options.Dimension, Direction: options.Direction, Items: items}, nil
 }
 
-func (store *Store) dimensionLeaders(start, end time.Time, dimension RankingDimension, limit int, filter TrafficFilter, directions ...RankingDirection) ([]Leader, error) {
+func (store *Store) dimensionLeaders(start, end time.Time, dimension RankingDimension, direction RankingDirection, limit int, filter TrafficFilter) ([]Leader, error) {
 	nameExpression := "app.name"
 	name := "App"
 	if dimension == DimensionHost {
@@ -947,9 +947,9 @@ func (store *Store) dimensionLeaders(start, end time.Time, dimension RankingDime
 		name = "domain"
 	}
 	orderExpression := "SUM(traffic.upload_bytes + traffic.download_bytes)"
-	if len(directions) > 0 && directions[0] == DirectionUpload {
+	if direction == DirectionUpload {
 		orderExpression = "SUM(traffic.upload_bytes)"
-	} else if len(directions) > 0 && directions[0] == DirectionDownload {
+	} else if direction == DirectionDownload {
 		orderExpression = "SUM(traffic.download_bytes)"
 	}
 	statement := `
