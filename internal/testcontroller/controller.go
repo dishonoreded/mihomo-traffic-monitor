@@ -3,6 +3,7 @@ package testcontroller
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 type Options struct {
 	RequiredSecret    string
+	Authorize         func(*http.Request) bool
 	Version           string
 	VersionStatus     int
 	ConnectionsStatus int
@@ -23,6 +25,7 @@ type Controller struct {
 	URL               string
 	VersionRequests   atomic.Int32
 	ConnectionStreams atomic.Int32
+	server            *httptest.Server
 }
 
 type TrafficConnection struct {
@@ -43,9 +46,14 @@ type TrafficSnapshot struct {
 
 func Start(t testing.TB, options Options) *Controller {
 	t.Helper()
+	return StartAt(t, "127.0.0.1:0", options)
+}
+
+func StartAt(t testing.TB, address string, options Options) *Controller {
+	t.Helper()
 	controller := &Controller{}
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if options.RequiredSecret != "" && request.Header.Get("Authorization") != "Bearer "+options.RequiredSecret {
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if (options.RequiredSecret != "" && request.Header.Get("Authorization") != "Bearer "+options.RequiredSecret) || (options.Authorize != nil && !options.Authorize(request)) {
 			http.Error(response, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -81,10 +89,22 @@ func Start(t testing.TB, options Options) *Controller {
 		default:
 			http.NotFound(response, request)
 		}
-	}))
+	})
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("listen for fake Controller: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	controller.server = server
 	controller.URL = server.URL
-	t.Cleanup(server.Close)
+	t.Cleanup(controller.Close)
 	return controller
+}
+
+func (controller *Controller) Close() {
+	controller.server.Close()
 }
 
 func DisconnectedURL() string {

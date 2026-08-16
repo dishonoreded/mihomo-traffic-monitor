@@ -1,6 +1,9 @@
 package api
 
-import "github.com/dishonoreded/mihomo-traffic-monitor/internal/collector"
+import (
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/collector"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
+)
 
 type controllerAuthentication string
 
@@ -15,7 +18,14 @@ type statusResponse struct {
 	Collector     collectorStatus     `json:"collector"`
 	Live          liveStatus          `json:"live"`
 	Database      databaseStatus      `json:"database"`
+	Collection    collectionStatus    `json:"collection"`
 	Configuration configurationStatus `json:"configuration"`
+}
+
+type collectionStatus struct {
+	CurrentGap *continuity.Gap  `json:"currentGap"`
+	RecentGaps []continuity.Gap `json:"recentGaps"`
+	Error      *string          `json:"error"`
 }
 
 type collectorStatus struct {

@@ -20,8 +20,31 @@ const statusResponse = {
   database: {
     healthy: true,
     sizeBytes: 12288,
-    schemaVersion: 2,
+    schemaVersion: 3,
     journalMode: "wal",
+    error: null,
+  },
+  collection: {
+    currentGap: {
+      id: 2,
+      startedAt: "2026-08-14T06:20:00Z",
+      endedAt: null,
+      open: true,
+      reason: "authentication_failed",
+      disposition: "open",
+      recoveredUpload: 0,
+      recoveredDownload: 0,
+    },
+    recentGaps: [{
+      id: 1,
+      startedAt: "2026-08-14T06:00:00Z",
+      endedAt: "2026-08-14T06:10:00Z",
+      open: false,
+      reason: "disconnected",
+      disposition: "recovered",
+      recoveredUpload: 30,
+      recoveredDownload: 60,
+    }],
     error: null,
   },
   configuration: {
@@ -83,8 +106,12 @@ test("user can inspect the unavailable local observatory and navigate its empty 
 
   await user.click(screen.getByRole("link", { name: "Status" }));
   expect(screen.getByText("http://127.0.0.1:9090")).toBeVisible();
-  expect(screen.getByText("WAL · schema 2")).toBeVisible();
+  expect(screen.getByText("WAL · schema 3")).toBeVisible();
   expect(screen.getByText(statusResponse.configuration.databasePath)).toBeVisible();
+  expect(screen.getByText("Gap open")).toBeVisible();
+  expect(screen.getByText(/Authentication failed/)).toBeVisible();
+  expect(screen.getByText("Recovered 90 B")).toBeVisible();
+  expect(screen.getByText("Upload 30 B · Download 60 B")).toBeVisible();
 });
 
 test("live events drive the directional trace and current connection readouts", async () => {

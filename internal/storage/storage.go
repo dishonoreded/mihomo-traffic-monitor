@@ -7,11 +7,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 type Store struct {
 	database *sql.DB
@@ -208,6 +209,37 @@ func (store *Store) migrate() error {
 			return fmt.Errorf("record schema version 2: %w", err)
 		}
 	}
+	if version < 3 {
+		if _, err := transaction.Exec(`
+			CREATE TABLE collector_state (
+				singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+				sampled_at_ns INTEGER NOT NULL,
+				upload_total INTEGER NOT NULL CHECK(upload_total >= 0),
+				download_total INTEGER NOT NULL CHECK(download_total >= 0)
+			);
+			CREATE TABLE collection_gaps (
+				id INTEGER PRIMARY KEY,
+				started_at_ns INTEGER NOT NULL,
+				ended_at_ns INTEGER,
+				reason TEXT NOT NULL,
+				disposition TEXT NOT NULL CHECK(disposition IN ('open', 'recovered', 'no_growth', 'reset')),
+				recovered_upload INTEGER NOT NULL DEFAULT 0 CHECK(recovered_upload >= 0),
+				recovered_download INTEGER NOT NULL DEFAULT 0 CHECK(recovered_download >= 0),
+				CHECK(
+					(ended_at_ns IS NULL AND disposition = 'open')
+					OR (ended_at_ns IS NOT NULL AND disposition != 'open')
+				)
+			);
+			CREATE UNIQUE INDEX collection_gaps_one_open
+				ON collection_gaps((1)) WHERE ended_at_ns IS NULL;
+			CREATE INDEX collection_gaps_range ON collection_gaps(started_at_ns, ended_at_ns);
+		`); err != nil {
+			return fmt.Errorf("create collection continuity schema: %w", err)
+		}
+		if _, err := transaction.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record schema version 3: %w", err)
+		}
+	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit migration: %w", err)
 	}
@@ -223,6 +255,16 @@ func (store *Store) AddTraffic(records []traffic.Record) error {
 		return fmt.Errorf("begin traffic transaction: %w", err)
 	}
 	defer func() { _ = transaction.Rollback() }()
+	if err := addTrafficRecords(transaction, records); err != nil {
+		return err
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit traffic transaction: %w", err)
+	}
+	return nil
+}
+
+func addTrafficRecords(transaction *sql.Tx, records []traffic.Record) error {
 	for _, record := range records {
 		if err := validateRecord(record); err != nil {
 			return err
@@ -251,10 +293,193 @@ func (store *Store) AddTraffic(records []traffic.Record) error {
 			return fmt.Errorf("upsert minute traffic: %w", err)
 		}
 	}
+	return nil
+}
+
+func (store *Store) OpenCollectionGap(reason continuity.Reason) error {
+	if reason == "" {
+		return fmt.Errorf("Collection gap reason is required")
+	}
+	transaction, err := store.database.Begin()
+	if err != nil {
+		return fmt.Errorf("begin Collection gap transaction: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	var sampledAt int64
+	if err := transaction.QueryRow(`SELECT sampled_at_ns FROM collector_state WHERE singleton = 1`).Scan(&sampledAt); err != nil {
+		if err == sql.ErrNoRows {
+			return transaction.Commit()
+		}
+		return fmt.Errorf("read collector state for Collection gap: %w", err)
+	}
+	var openID int64
+	err = transaction.QueryRow(`SELECT id FROM collection_gaps WHERE ended_at_ns IS NULL`).Scan(&openID)
+	switch {
+	case err == nil:
+		if _, err := transaction.Exec(`UPDATE collection_gaps SET reason = ? WHERE id = ?`, reason, openID); err != nil {
+			return fmt.Errorf("update open Collection gap: %w", err)
+		}
+	case err == sql.ErrNoRows:
+		if _, err := transaction.Exec(`
+			INSERT INTO collection_gaps(started_at_ns, reason, disposition)
+			VALUES(?, ?, ?)
+		`, sampledAt, reason, continuity.DispositionOpen); err != nil {
+			return fmt.Errorf("open Collection gap: %w", err)
+		}
+	default:
+		return fmt.Errorf("read open Collection gap: %w", err)
+	}
 	if err := transaction.Commit(); err != nil {
-		return fmt.Errorf("commit traffic transaction: %w", err)
+		return fmt.Errorf("commit Collection gap: %w", err)
 	}
 	return nil
+}
+
+func (store *Store) AcceptSample(state continuity.State, records []traffic.Record) (continuity.Acceptance, error) {
+	if state.SampledAt.IsZero() || state.UploadTotal < 0 || state.DownloadTotal < 0 {
+		return continuity.Acceptance{}, fmt.Errorf("valid collector sample state is required")
+	}
+	transaction, err := store.database.Begin()
+	if err != nil {
+		return continuity.Acceptance{}, fmt.Errorf("begin collector sample transaction: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	var previous continuity.State
+	var previousAt int64
+	stateErr := transaction.QueryRow(`
+		SELECT sampled_at_ns, upload_total, download_total
+		FROM collector_state WHERE singleton = 1
+	`).Scan(&previousAt, &previous.UploadTotal, &previous.DownloadTotal)
+	if stateErr != nil && stateErr != sql.ErrNoRows {
+		return continuity.Acceptance{}, fmt.Errorf("read collector state: %w", stateErr)
+	}
+	if stateErr == nil {
+		previous.SampledAt = time.Unix(0, previousAt).UTC()
+	}
+
+	result := continuity.Acceptance{}
+	gap, err := openGap(transaction)
+	if err != nil {
+		return continuity.Acceptance{}, err
+	}
+	recovery := continuity.Recovery{Disposition: continuity.DispositionReset}
+	if stateErr == nil {
+		recovery = continuity.EvaluateRecovery(previous, state)
+	}
+	if gap == nil && recovery.Disposition == continuity.DispositionReset && stateErr == nil {
+		endedAt := state.SampledAt.UTC()
+		inserted, err := transaction.Exec(`
+			INSERT INTO collection_gaps(
+				started_at_ns, ended_at_ns, reason, disposition, recovered_upload, recovered_download
+			) VALUES(?, ?, ?, ?, 0, 0)
+		`, previous.SampledAt.UnixNano(), endedAt.UnixNano(), continuity.ReasonCounterReset, continuity.DispositionReset)
+		if err != nil {
+			return continuity.Acceptance{}, fmt.Errorf("record Controller counter reset: %w", err)
+		}
+		gapID, err := inserted.LastInsertId()
+		if err != nil {
+			return continuity.Acceptance{}, fmt.Errorf("resolve Controller counter reset: %w", err)
+		}
+		result.Gap = &continuity.Gap{
+			ID: gapID, StartedAt: previous.SampledAt, EndedAt: &endedAt,
+			Reason: continuity.ReasonCounterReset, Disposition: continuity.DispositionReset,
+		}
+	}
+	if gap != nil {
+		if recovery.Disposition == continuity.DispositionRecovered {
+			if err := addTrafficRecords(transaction, []traffic.Record{{
+				Minute: state.SampledAt, Class: traffic.GapRecovered, Upload: recovery.Upload, Download: recovery.Download,
+			}}); err != nil {
+				return continuity.Acceptance{}, err
+			}
+		}
+		endedAt := state.SampledAt.UTC()
+		if _, err := transaction.Exec(`
+			UPDATE collection_gaps
+			SET ended_at_ns = ?, disposition = ?, recovered_upload = ?, recovered_download = ?
+			WHERE id = ?
+		`, endedAt.UnixNano(), recovery.Disposition, recovery.Upload, recovery.Download, gap.ID); err != nil {
+			return continuity.Acceptance{}, fmt.Errorf("close Collection gap: %w", err)
+		}
+		gap.EndedAt = &endedAt
+		gap.Open = false
+		gap.Disposition = recovery.Disposition
+		gap.RecoveredUpload = recovery.Upload
+		gap.RecoveredDownload = recovery.Download
+		result.Gap = gap
+	}
+	if err := addTrafficRecords(transaction, records); err != nil {
+		return continuity.Acceptance{}, err
+	}
+	if _, err := transaction.Exec(`
+		INSERT INTO collector_state(singleton, sampled_at_ns, upload_total, download_total)
+		VALUES(1, ?, ?, ?)
+		ON CONFLICT(singleton) DO UPDATE SET
+			sampled_at_ns = excluded.sampled_at_ns,
+			upload_total = excluded.upload_total,
+			download_total = excluded.download_total
+	`, state.SampledAt.UTC().UnixNano(), state.UploadTotal, state.DownloadTotal); err != nil {
+		return continuity.Acceptance{}, fmt.Errorf("persist collector state: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return continuity.Acceptance{}, fmt.Errorf("commit collector sample: %w", err)
+	}
+	return result, nil
+}
+
+func openGap(transaction *sql.Tx) (*continuity.Gap, error) {
+	var gap continuity.Gap
+	var startedAt int64
+	err := transaction.QueryRow(`
+		SELECT id, started_at_ns, reason
+		FROM collection_gaps WHERE ended_at_ns IS NULL
+	`).Scan(&gap.ID, &startedAt, &gap.Reason)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read open Collection gap: %w", err)
+	}
+	gap.StartedAt = time.Unix(0, startedAt).UTC()
+	gap.Open = true
+	gap.Disposition = continuity.DispositionOpen
+	return &gap, nil
+}
+
+func (store *Store) CollectionGaps(start, end time.Time) ([]continuity.Gap, error) {
+	if !end.After(start) {
+		return nil, fmt.Errorf("Collection gap end must be after start")
+	}
+	rows, err := store.database.Query(`
+		SELECT id, started_at_ns, ended_at_ns, reason, disposition, recovered_upload, recovered_download
+		FROM collection_gaps
+		WHERE started_at_ns < ? AND (ended_at_ns IS NULL OR ended_at_ns > ?)
+		ORDER BY started_at_ns DESC, id DESC
+	`, end.UTC().UnixNano(), start.UTC().UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("query Collection gaps: %w", err)
+	}
+	defer rows.Close()
+	gaps := []continuity.Gap{}
+	for rows.Next() {
+		var gap continuity.Gap
+		var startedAt int64
+		var endedAt sql.NullInt64
+		if err := rows.Scan(&gap.ID, &startedAt, &endedAt, &gap.Reason, &gap.Disposition, &gap.RecoveredUpload, &gap.RecoveredDownload); err != nil {
+			return nil, fmt.Errorf("scan Collection gap: %w", err)
+		}
+		gap.StartedAt = time.Unix(0, startedAt).UTC()
+		gap.Open = !endedAt.Valid
+		if endedAt.Valid {
+			value := time.Unix(0, endedAt.Int64).UTC()
+			gap.EndedAt = &value
+		}
+		gaps = append(gaps, gap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Collection gaps: %w", err)
+	}
+	return gaps, nil
 }
 
 func validateRecord(record traffic.Record) error {
