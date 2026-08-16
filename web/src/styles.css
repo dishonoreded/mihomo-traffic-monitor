@@ -99,6 +99,13 @@ a:focus-visible { outline: 3px solid var(--download); outline-offset: 4px; }
 .diagnostic dt { color: var(--muted); font: 600 10px/1 "SFMono-Regular", monospace; text-transform: uppercase; }
 .diagnostic dd { margin: 20px 0 0; font: 650 16px/1.3 "Avenir Next", sans-serif; }
 .diagnostic p { margin: 8px 0 0; color: var(--muted); font-size: 11px; }
+.gap-history { grid-column: span 2; min-height: 0; }
+.gap-history dd { margin-top: 14px; }
+.gap-history dd > p { margin: 0; }
+.gap-history ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; margin: 0; padding: 0; list-style: none; }
+.gap-history li { display: grid; gap: 6px; padding: 12px 0; border-top: 1px solid var(--line); }
+.gap-history li strong { color: var(--unknown); font: 650 13px/1.2 "Avenir Next", sans-serif; }
+.gap-history li span { color: var(--muted); font: 600 10px/1.3 "SFMono-Regular", monospace; overflow-wrap: anywhere; }
 footer { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: space-between; padding-top: 18px; color: var(--muted); font: 600 9px/1.4 "SFMono-Regular", monospace; letter-spacing: 0; text-transform: uppercase; }
 
 @media (max-width: 780px) {
@@ -111,6 +118,8 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: space-
   .trace-field { height: 250px; }
   .readout-panel h1, .empty-page h1, .status-page h1 { font-size: 38px; }
   .diagnostic-grid { grid-template-columns: 1fr; }
+  .gap-history { grid-column: auto; }
+  .gap-history ul { grid-template-columns: 1fr; }
   .history-band { grid-template-columns: 1fr; }
   .today-summary { border-right: 0; border-bottom: 1px solid var(--ink); }
   .leader-columns { grid-template-columns: 1fr; }

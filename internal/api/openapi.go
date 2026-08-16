@@ -3,6 +3,7 @@ package api
 func openAPISpecification() map[string]any {
 	statusReference := map[string]any{"$ref": "#/components/schemas/Status"}
 	summaryReference := map[string]any{"$ref": "#/components/schemas/Summary"}
+	gapsReference := map[string]any{"$ref": "#/components/schemas/Gaps"}
 	timeParameter := func(name string) map[string]any {
 		return map[string]any{
 			"name": name, "in": "query", "required": true,
@@ -16,6 +17,20 @@ func openAPISpecification() map[string]any {
 			"version": "1.0.0",
 		},
 		"paths": map[string]any{
+			"/api/v1/gaps": map[string]any{
+				"get": map[string]any{
+					"operationId": "getCollectionGaps",
+					"summary":     "List open and closed Collection gaps overlapping a half-open time range",
+					"parameters":  []any{timeParameter("start"), timeParameter("end")},
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Collection gap diagnostics and directional recovered totals",
+							"content":     map[string]any{"application/json": map[string]any{"schema": gapsReference}},
+						},
+						"400": map[string]any{"description": "Missing, malformed, or empty time range"},
+					},
+				},
+			},
 			"/api/v1/summary": map[string]any{
 				"get": map[string]any{
 					"operationId": "getTrafficSummary",
@@ -68,6 +83,36 @@ func openAPISpecification() map[string]any {
 		},
 		"components": map[string]any{
 			"schemas": map[string]any{
+				"Gap": map[string]any{
+					"type":     "object",
+					"required": []string{"id", "startedAt", "endedAt", "open", "reason", "disposition", "recoveredUpload", "recoveredDownload"},
+					"properties": map[string]any{
+						"id":                map[string]any{"type": "integer", "minimum": 1},
+						"startedAt":         map[string]any{"type": "string", "format": "date-time"},
+						"endedAt":           map[string]any{"type": []string{"string", "null"}, "format": "date-time"},
+						"open":              map[string]any{"type": "boolean"},
+						"reason":            map[string]any{"type": "string"},
+						"disposition":       map[string]any{"type": "string", "enum": []string{"open", "recovered", "no_growth", "reset"}},
+						"recoveredUpload":   map[string]any{"type": "integer", "minimum": 0},
+						"recoveredDownload": map[string]any{"type": "integer", "minimum": 0},
+					},
+				},
+				"Gaps": map[string]any{
+					"type":     "object",
+					"required": []string{"apiVersion", "range", "gaps"},
+					"properties": map[string]any{
+						"apiVersion": map[string]any{"type": "string", "const": "v1"},
+						"range": map[string]any{
+							"type":     "object",
+							"required": []string{"start", "end"},
+							"properties": map[string]any{
+								"start": map[string]any{"type": "string", "format": "date-time"},
+								"end":   map[string]any{"type": "string", "format": "date-time"},
+							},
+						},
+						"gaps": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Gap"}},
+					},
+				},
 				"AttributionTotals": map[string]any{
 					"type":     "object",
 					"required": []string{"observed", "residual", "gapRecovered", "total"},
@@ -117,7 +162,7 @@ func openAPISpecification() map[string]any {
 				},
 				"Status": map[string]any{
 					"type":     "object",
-					"required": []string{"apiVersion", "timestamp", "collector", "live", "database", "configuration"},
+					"required": []string{"apiVersion", "timestamp", "collector", "live", "database", "collection", "configuration"},
 					"properties": map[string]any{
 						"apiVersion": map[string]any{"type": "string", "const": "v1"},
 						"timestamp":  map[string]any{"type": "string", "format": "date-time"},
@@ -150,6 +195,15 @@ func openAPISpecification() map[string]any {
 								"schemaVersion": map[string]any{"type": "integer", "minimum": 1},
 								"journalMode":   map[string]any{"type": "string"},
 								"error":         map[string]any{"type": []string{"string", "null"}},
+							},
+						},
+						"collection": map[string]any{
+							"type":     "object",
+							"required": []string{"currentGap", "recentGaps", "error"},
+							"properties": map[string]any{
+								"currentGap": map[string]any{"anyOf": []any{map[string]any{"$ref": "#/components/schemas/Gap"}, map[string]any{"type": "null"}}},
+								"recentGaps": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Gap"}},
+								"error":      map[string]any{"type": []string{"string", "null"}},
 							},
 						},
 						"configuration": map[string]any{

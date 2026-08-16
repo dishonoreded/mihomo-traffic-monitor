@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/storage"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 )
@@ -29,7 +30,7 @@ func TestOpenCreatesPrivateMigratedWALDatabase(t *testing.T) {
 	if got, want := info.JournalMode, "wal"; got != want {
 		t.Fatalf("journal mode = %q, want %q", got, want)
 	}
-	if got, want := info.SchemaVersion, 2; got != want {
+	if got, want := info.SchemaVersion, 3; got != want {
 		t.Fatalf("schema version = %d, want %d", got, want)
 	}
 	var storedBytes int64
@@ -44,6 +45,149 @@ func TestOpenCreatesPrivateMigratedWALDatabase(t *testing.T) {
 
 	assertPermissions(t, dataDirectory, 0o700)
 	assertPermissions(t, databasePath, 0o600)
+}
+
+func TestCollectionGapRecoveryIsAtomicAndStoredOnlyInTheReconnectMinute(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	if _, err := store.AcceptSample(continuity.State{SampledAt: start, UploadTotal: 100, DownloadTotal: 200}, nil); err != nil {
+		t.Fatalf("accept baseline: %v", err)
+	}
+	if err := store.OpenCollectionGap("disconnected"); err != nil {
+		t.Fatalf("open Collection gap: %v", err)
+	}
+	reconnectedAt := start.Add(5 * time.Minute)
+	result, err := store.AcceptSample(continuity.State{SampledAt: reconnectedAt, UploadTotal: 130, DownloadTotal: 260}, nil)
+	if err != nil {
+		t.Fatalf("accept reconnection: %v", err)
+	}
+	if result.Gap == nil || result.Gap.Disposition != continuity.DispositionRecovered || result.Gap.RecoveredUpload != 30 || result.Gap.RecoveredDownload != 60 {
+		t.Fatalf("recovery result = %+v", result)
+	}
+
+	before, err := store.Summary(start, reconnectedAt)
+	if err != nil {
+		t.Fatalf("query gap interval: %v", err)
+	}
+	if before.Total.GapRecovered != 0 {
+		t.Fatalf("recovered traffic was interpolated into the gap: %+v", before.Total)
+	}
+	after, err := store.Summary(reconnectedAt, reconnectedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("query reconnect minute: %v", err)
+	}
+	if after.Upload.GapRecovered != 30 || after.Download.GapRecovered != 60 || after.Total.Total != 90 {
+		t.Fatalf("reconnect-minute summary = %+v", after)
+	}
+
+	gaps, err := store.CollectionGaps(start, reconnectedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("query Collection gaps: %v", err)
+	}
+	if len(gaps) != 1 || gaps[0].Open || !gaps[0].StartedAt.Equal(start) || gaps[0].EndedAt == nil || !gaps[0].EndedAt.Equal(reconnectedAt) || gaps[0].Reason != "disconnected" {
+		t.Fatalf("stored Collection gaps = %+v", gaps)
+	}
+}
+
+func TestCounterResetCreatesANewBaselineWithoutRecoveredTraffic(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 16, 11, 0, 0, 0, time.UTC)
+	if _, err := store.AcceptSample(continuity.State{SampledAt: start, UploadTotal: 900, DownloadTotal: 1_200}, nil); err != nil {
+		t.Fatalf("accept baseline: %v", err)
+	}
+	resetAt := start.Add(time.Second)
+	result, err := store.AcceptSample(continuity.State{SampledAt: resetAt, UploadTotal: 3, DownloadTotal: 7}, nil)
+	if err != nil {
+		t.Fatalf("accept reset: %v", err)
+	}
+	if result.Gap == nil || result.Gap.Disposition != continuity.DispositionReset || result.Gap.RecoveredUpload != 0 || result.Gap.RecoveredDownload != 0 {
+		t.Fatalf("reset acceptance = %+v", result)
+	}
+
+	gaps, err := store.CollectionGaps(start.Add(-time.Second), resetAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("query reset gap: %v", err)
+	}
+	if len(gaps) != 1 || gaps[0].Reason != "counter_reset" || gaps[0].EndedAt == nil || !gaps[0].EndedAt.Equal(resetAt) {
+		t.Fatalf("reset gaps = %+v", gaps)
+	}
+	summary, err := store.Summary(start, resetAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("query reset summary: %v", err)
+	}
+	if summary.Total.Total != 0 {
+		t.Fatalf("counter reset produced traffic: %+v", summary.Total)
+	}
+}
+
+func TestOpenCollectionGapIsIdempotentAcrossStoreRestart(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	start := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	if _, err := store.AcceptSample(continuity.State{SampledAt: start, UploadTotal: 100, DownloadTotal: 200}, nil); err != nil {
+		t.Fatalf("accept baseline: %v", err)
+	}
+	if err := store.OpenCollectionGap("disconnected"); err != nil {
+		t.Fatalf("open initial gap: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	store, err = storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.OpenCollectionGap("monitor_restart"); err != nil {
+		t.Fatalf("resume gap after restart: %v", err)
+	}
+	gaps, err := store.CollectionGaps(start.Add(-time.Second), start.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("query open gap: %v", err)
+	}
+	if len(gaps) != 1 || !gaps[0].Open || gaps[0].Reason != "monitor_restart" || !gaps[0].StartedAt.Equal(start) {
+		t.Fatalf("resumed gaps = %+v", gaps)
+	}
+
+	reconnectedAt := start.Add(10 * time.Minute)
+	result, err := store.AcceptSample(continuity.State{SampledAt: reconnectedAt, UploadTotal: 140, DownloadTotal: 260}, nil)
+	if err != nil {
+		t.Fatalf("accept restarted collector sample: %v", err)
+	}
+	if result.Gap == nil || result.Gap.ID != gaps[0].ID || result.Gap.RecoveredUpload != 40 || result.Gap.RecoveredDownload != 60 {
+		t.Fatalf("restarted acceptance = %+v", result)
+	}
+	if err := store.OpenCollectionGap("disconnected"); err != nil {
+		t.Fatalf("open second gap: %v", err)
+	}
+	if err := store.OpenCollectionGap("authentication_failed"); err != nil {
+		t.Fatalf("update second gap: %v", err)
+	}
+	gaps, err = store.CollectionGaps(start.Add(-time.Second), reconnectedAt.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("query all gaps: %v", err)
+	}
+	if len(gaps) != 2 || !gaps[0].Open || gaps[0].Reason != "authentication_failed" || gaps[1].ID != result.Gap.ID {
+		t.Fatalf("idempotent gaps = %+v", gaps)
+	}
 }
 
 func TestMinuteTrafficUPSERTAndHalfOpenSummarySurviveReopen(t *testing.T) {

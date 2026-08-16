@@ -14,6 +14,7 @@ import (
 
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/api"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/config"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/storage"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 )
@@ -73,7 +74,7 @@ func TestStatusReportsPrivateLocalObservatoryState(t *testing.T) {
 	if body.APIVersion != "v1" || body.Collector.State != "unavailable" {
 		t.Fatalf("unexpected API/collector state: %+v", body)
 	}
-	if !body.Database.Healthy || body.Database.SchemaVersion != 2 || body.Database.SizeBytes <= 0 {
+	if !body.Database.Healthy || body.Database.SchemaVersion != 3 || body.Database.SizeBytes <= 0 {
 		t.Fatalf("unexpected database state: %+v", body.Database)
 	}
 	if body.Configuration.ControllerURL != cfg.ControllerURL || body.Configuration.DashboardAddress != cfg.DashboardAddress || body.Configuration.SampleInterval != "1s" {
@@ -82,6 +83,75 @@ func TestStatusReportsPrivateLocalObservatoryState(t *testing.T) {
 	if body.Configuration.ControllerAuthentication != "configured" {
 		t.Fatalf("authentication diagnostic = %q, want configured", body.Configuration.ControllerAuthentication)
 	}
+}
+
+func TestGapsReturnsBoundedOpenAndClosedCollectionGaps(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	if _, err := store.AcceptSample(continuity.State{SampledAt: start, UploadTotal: 100, DownloadTotal: 200}, nil); err != nil {
+		t.Fatalf("accept baseline: %v", err)
+	}
+	if err := store.OpenCollectionGap("disconnected"); err != nil {
+		t.Fatalf("open gap: %v", err)
+	}
+	reconnectedAt := start.Add(5 * time.Minute)
+	if _, err := store.AcceptSample(continuity.State{SampledAt: reconnectedAt, UploadTotal: 130, DownloadTotal: 260}, nil); err != nil {
+		t.Fatalf("close recovered gap: %v", err)
+	}
+	if err := store.OpenCollectionGap("authentication_failed"); err != nil {
+		t.Fatalf("open current gap: %v", err)
+	}
+
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+	queryStart := start.Add(-time.Minute)
+	queryEnd := reconnectedAt.Add(time.Minute)
+	path := "/api/v1/gaps?start=" + url.QueryEscape(queryStart.Format(time.RFC3339)) + "&end=" + url.QueryEscape(queryEnd.Format(time.RFC3339))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("gaps status = %d: %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		APIVersion string           `json:"apiVersion"`
+		Range      summaryRangeJSON `json:"range"`
+		Gaps       []continuity.Gap `json:"gaps"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode gaps: %v", err)
+	}
+	if payload.APIVersion != "v1" || payload.Range.Start != queryStart.Format(time.RFC3339) || payload.Range.End != queryEnd.Format(time.RFC3339) {
+		t.Fatalf("gaps range = %+v, API = %q", payload.Range, payload.APIVersion)
+	}
+	if len(payload.Gaps) != 2 || !payload.Gaps[0].Open || payload.Gaps[0].Reason != "authentication_failed" || payload.Gaps[1].Disposition != continuity.DispositionRecovered || payload.Gaps[1].RecoveredUpload != 30 || payload.Gaps[1].RecoveredDownload != 60 {
+		t.Fatalf("gaps payload = %+v", payload.Gaps)
+	}
+	statusResult := httptest.NewRecorder()
+	handler.ServeHTTP(statusResult, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	var statusPayload struct {
+		Collection struct {
+			CurrentGap *continuity.Gap  `json:"currentGap"`
+			RecentGaps []continuity.Gap `json:"recentGaps"`
+			Error      *string          `json:"error"`
+		} `json:"collection"`
+	}
+	if err := json.Unmarshal(statusResult.Body.Bytes(), &statusPayload); err != nil {
+		t.Fatalf("decode status Collection diagnostics: %v", err)
+	}
+	if statusPayload.Collection.CurrentGap == nil || statusPayload.Collection.CurrentGap.Reason != "authentication_failed" || len(statusPayload.Collection.RecentGaps) != 1 || statusPayload.Collection.Error != nil {
+		t.Fatalf("status Collection diagnostics = %+v", statusPayload.Collection)
+	}
+}
+
+type summaryRangeJSON struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
 }
 
 func TestSummaryReturnsHalfOpenAttributionTotalsCoverageAndLeaders(t *testing.T) {
@@ -151,6 +221,9 @@ func TestSummaryRejectsMissingMalformedAndEmptyRanges(t *testing.T) {
 		"/api/v1/summary",
 		"/api/v1/summary?start=not-a-time&end=2026-08-14T01:00:00Z",
 		"/api/v1/summary?start=2026-08-14T01:00:00Z&end=2026-08-14T01:00:00Z",
+		"/api/v1/gaps",
+		"/api/v1/gaps?start=not-a-time&end=2026-08-14T01:00:00Z",
+		"/api/v1/gaps?start=2026-08-14T01:00:00Z&end=2026-08-14T01:00:00Z",
 	} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
@@ -207,6 +280,12 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 	}
 	if _, ok := paths["/api/v1/summary"]; !ok {
 		t.Fatal("OpenAPI is missing the traffic summary")
+	}
+	if _, ok := paths["/api/v1/gaps"]; !ok {
+		t.Fatal("OpenAPI is missing Collection gaps")
+	}
+	if _, ok := schemas["Gap"]; !ok {
+		t.Fatal("OpenAPI is missing the Gap schema")
 	}
 	if _, ok := schemas["Summary"]; !ok {
 		t.Fatal("OpenAPI is missing the Summary schema")

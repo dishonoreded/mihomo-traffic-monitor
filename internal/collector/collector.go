@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/dishonoreded/mihomo-traffic-monitor/internal/continuity"
 	"github.com/dishonoreded/mihomo-traffic-monitor/internal/traffic"
 )
 
@@ -40,6 +41,8 @@ const (
 
 type TrafficSink interface {
 	AddTraffic([]traffic.Record) error
+	OpenCollectionGap(continuity.Reason) error
+	AcceptSample(continuity.State, []traffic.Record) (continuity.Acceptance, error)
 }
 
 type Config struct {
@@ -127,6 +130,9 @@ func (collector *Collector) Subscribe() (<-chan Snapshot, func()) {
 
 func (collector *Collector) Run(ctx context.Context) {
 	retryDelay := max(collector.configuration.SampleInterval, time.Second)
+	if err := collector.openGap(continuity.ReasonMonitorRestart); err != nil {
+		collector.publish(collector.transitionSnapshot(StateUnavailable, ReasonStorageFailed, err.Error()))
+	}
 	for ctx.Err() == nil {
 		collector.publish(collector.transitionSnapshot(StateConnecting, ReasonConnecting, "Connecting to Mihomo External Controller."))
 		failure := collector.collect(ctx)
@@ -136,6 +142,9 @@ func (collector *Collector) Run(ctx context.Context) {
 		var classified collectionError
 		if !errors.As(failure, &classified) {
 			classified = collectionError{reason: ReasonUnreachable, message: "Mihomo External Controller is unavailable. Check its URL and that External Controller is enabled."}
+		}
+		if err := collector.openGap(continuityReason(classified.reason)); err != nil {
+			classified = collectionError{reason: ReasonStorageFailed, message: err.Error()}
 		}
 		collector.publish(collector.transitionSnapshot(StateUnavailable, classified.reason, classified.message))
 		timer := time.NewTimer(retryDelay)
@@ -206,7 +215,7 @@ func (collector *Collector) collect(ctx context.Context) (result error) {
 		if err != nil {
 			return collectionError{reason: ReasonInvalidSchema, message: "Mihomo returned an incompatible connections payload: " + err.Error()}
 		}
-		if err := collector.persist(reconciler.Add(trafficSample)); err != nil {
+		if err := collector.acceptSample(trafficSample, reconciler.Add(trafficSample)); err != nil {
 			return err
 		}
 		live := Snapshot{
@@ -246,6 +255,45 @@ func (collector *Collector) persist(records []traffic.Record) error {
 		return collectionError{reason: ReasonStorageFailed, message: "Traffic history could not be written to the local database. Check database status and available disk space."}
 	}
 	return nil
+}
+
+func (collector *Collector) acceptSample(sample traffic.Sample, records []traffic.Record) error {
+	if collector.configuration.TrafficSink == nil {
+		return nil
+	}
+	if _, err := collector.configuration.TrafficSink.AcceptSample(continuity.State{
+		SampledAt: sample.At, UploadTotal: sample.UploadTotal, DownloadTotal: sample.DownloadTotal,
+	}, records); err != nil {
+		return collectionError{reason: ReasonStorageFailed, message: "Traffic history could not be written to the local database. Check database status and available disk space."}
+	}
+	return nil
+}
+
+func (collector *Collector) openGap(reason continuity.Reason) error {
+	if collector.configuration.TrafficSink == nil {
+		return nil
+	}
+	if err := collector.configuration.TrafficSink.OpenCollectionGap(reason); err != nil {
+		return collectionError{reason: ReasonStorageFailed, message: "Collection continuity could not be written to the local database. Check database status and available disk space."}
+	}
+	return nil
+}
+
+func continuityReason(reason Reason) continuity.Reason {
+	switch reason {
+	case ReasonAuthenticationFailed:
+		return continuity.ReasonAuthenticationFailed
+	case ReasonIncompatibleVersion:
+		return continuity.ReasonIncompatibleVersion
+	case ReasonInvalidSchema:
+		return continuity.ReasonInvalidSchema
+	case ReasonDisconnected:
+		return continuity.ReasonDisconnected
+	case ReasonStorageFailed:
+		return continuity.ReasonStorageFailed
+	default:
+		return continuity.ReasonUnreachable
+	}
 }
 
 func toTrafficSample(snapshot wireSnapshot, at time.Time) (traffic.Sample, error) {

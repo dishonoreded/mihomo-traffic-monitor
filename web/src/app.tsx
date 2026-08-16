@@ -24,6 +24,11 @@ interface StatusResponse {
     journalMode: string;
     error: string | null;
   };
+  collection: {
+    currentGap: CollectionGap | null;
+    recentGaps: CollectionGap[];
+    error: string | null;
+  };
   configuration: {
     controllerUrl: string;
     controllerAuthentication: string;
@@ -31,6 +36,17 @@ interface StatusResponse {
     sampleInterval: string;
     databasePath: string;
   };
+}
+
+interface CollectionGap {
+  id: number;
+  startedAt: string;
+  endedAt: string | null;
+  open: boolean;
+  reason: string;
+  disposition: "open" | "recovered" | "no_growth" | "reset";
+  recoveredUpload: number;
+  recoveredDownload: number;
 }
 
 interface RatePoint {
@@ -309,6 +325,7 @@ function Analyze() {
 }
 
 function Status({ status }: { status: StatusResponse | null }) {
+  const currentGap = status?.collection.currentGap;
   return (
     <section className="status-page">
       <div><p className="eyebrow">System diagnostics</p><h1>Local observatory</h1><p>Only non-sensitive configuration is shown.</p></div>
@@ -318,8 +335,35 @@ function Status({ status }: { status: StatusResponse | null }) {
         <Diagnostic label="Database size" value={formatBytes(status?.database.sizeBytes ?? 0)} detail="Permanent minute history" />
         <Diagnostic label="Database location" value={status?.configuration.databasePath ?? "Checking"} detail="Private local storage · permanent retention" />
         <Diagnostic label="Authentication" value={status?.configuration.controllerAuthentication === "configured" ? "Configured" : "Not configured"} detail="Secret values are never displayed" />
+        <Diagnostic
+          label="Current Collection gap"
+          value={currentGap ? "Gap open" : status ? "No open gap" : "Checking"}
+          detail={currentGap ? `${humanizeReason(currentGap.reason)} · Since ${formatTimestamp(currentGap.startedAt)}` : status?.collection.error ?? "Collection is continuous"}
+        />
+        <GapHistory gaps={status?.collection.recentGaps ?? []} />
       </dl>
     </section>
+  );
+}
+
+function GapHistory({ gaps }: { gaps: CollectionGap[] }) {
+  return (
+    <div className="diagnostic gap-history">
+      <dt>Recent Collection gaps</dt>
+      <dd>
+        {gaps.length === 0 ? <p>No closed gaps in the last 24 hours</p> : (
+          <ul>
+            {gaps.map((gap) => (
+              <li key={gap.id}>
+                <strong>{gap.disposition === "recovered" ? `Recovered ${formatBytes(gap.recoveredUpload + gap.recoveredDownload)}` : humanizeReason(gap.disposition)}</strong>
+                <span>{humanizeReason(gap.reason)}</span>
+                <span>{`Upload ${formatBytes(gap.recoveredUpload)} · Download ${formatBytes(gap.recoveredDownload)}`}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </dd>
+    </div>
   );
 }
 
@@ -341,6 +385,15 @@ function controllerDetail(status: StatusResponse | null): string {
   if (!status) return "Reading local status";
   if (status.collector.controllerVersion) return `${status.collector.message} · Mihomo ${status.collector.controllerVersion}`;
   return status.collector.message;
+}
+
+function humanizeReason(value: string): string {
+  const words = value.replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function formatTimestamp(value: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
 function formatBytes(bytes: number): string {
