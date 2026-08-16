@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 	_ "time/tzdata"
 
@@ -43,6 +45,8 @@ func newHandler(configuration config.Config, store *storage.Store, assets fs.FS,
 	mux.Handle("/api/v1/status", getOnly(http.HandlerFunc(srv.status)))
 	mux.Handle("/api/v1/summary", getOnly(http.HandlerFunc(srv.summary)))
 	mux.Handle("/api/v1/series", getOnly(http.HandlerFunc(srv.series)))
+	mux.Handle("/api/v1/rankings", getOnly(http.HandlerFunc(srv.rankings)))
+	mux.Handle("/api/v1/dimensions", getOnly(http.HandlerFunc(srv.dimensions)))
 	mux.Handle("/api/v1/gaps", getOnly(http.HandlerFunc(srv.gaps)))
 	mux.Handle("/api/v1/live/events", getOnly(http.HandlerFunc(srv.liveEvents)))
 	mux.Handle("/api/v1/openapi.json", getOnly(http.HandlerFunc(srv.openAPIDocument)))
@@ -83,6 +87,7 @@ type summaryLeaders struct {
 
 type summaryResponse struct {
 	APIVersion string                    `json:"apiVersion"`
+	Scope      storage.TrafficScope      `json:"scope"`
 	Range      summaryRange              `json:"range"`
 	Upload     storage.AttributionTotals `json:"upload"`
 	Download   storage.AttributionTotals `json:"download"`
@@ -104,6 +109,7 @@ type seriesRange struct {
 
 type seriesResponse struct {
 	APIVersion  string                `json:"apiVersion"`
+	Scope       storage.TrafficScope  `json:"scope"`
 	Granularity storage.Granularity   `json:"granularity"`
 	PointLimit  int                   `json:"pointLimit"`
 	TimeZone    string                `json:"timeZone"`
@@ -122,7 +128,12 @@ func (srv *server) summary(response http.ResponseWriter, request *http.Request) 
 		})
 		return
 	}
-	result, err := srv.store.Summary(start, end)
+	filter, valid := requestedTrafficFilter(request)
+	if !valid {
+		writeInvalidFilter(response)
+		return
+	}
+	result, err := srv.store.FilteredSummary(start, end, filter)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{
@@ -134,6 +145,7 @@ func (srv *server) summary(response http.ResponseWriter, request *http.Request) 
 	}
 	writeJSON(response, http.StatusOK, summaryResponse{
 		APIVersion: "v1",
+		Scope:      result.Scope,
 		Range:      summaryRange{Start: start.Format(time.RFC3339Nano), End: end.Format(time.RFC3339Nano)},
 		Upload:     result.Upload,
 		Download:   result.Download,
@@ -175,7 +187,12 @@ func (srv *server) series(response http.ResponseWriter, request *http.Request) {
 		})
 		return
 	}
-	result, err := srv.store.Series(storage.SeriesOptions{Start: from, End: to, Granularity: granularity, Location: location})
+	filter, valid := requestedTrafficFilter(request)
+	if !valid {
+		writeInvalidFilter(response)
+		return
+	}
+	result, err := srv.store.Series(storage.SeriesOptions{Start: from, End: to, Granularity: granularity, Location: location, Filter: filter})
 	if errors.Is(err, storage.ErrAutoPointLimitExceeded) {
 		writeJSON(response, http.StatusUnprocessableEntity, map[string]any{
 			"error": map[string]string{
@@ -196,12 +213,130 @@ func (srv *server) series(response http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(response, http.StatusOK, seriesResponse{
 		APIVersion:  "v1",
+		Scope:       result.Scope,
 		Granularity: result.Granularity,
 		PointLimit:  storage.AutoPointLimit,
 		TimeZone:    locationName,
 		Range:       seriesRange{From: from.Format(time.RFC3339Nano), To: to.Format(time.RFC3339Nano)},
 		Points:      result.Points,
 	})
+}
+
+type dimensionsResponse struct {
+	APIVersion string   `json:"apiVersion"`
+	Query      string   `json:"query"`
+	Limit      int      `json:"limit"`
+	Apps       []string `json:"apps"`
+	Hosts      []string `json:"hosts"`
+	Domains    []string `json:"domains"`
+}
+
+func (srv *server) dimensions(response http.ResponseWriter, request *http.Request) {
+	limit, valid := requestedLimit(request, 20)
+	if !valid {
+		writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"code": "invalid_limit", "message": "Provide limit as an integer from 1 through 100.",
+		}})
+		return
+	}
+	query := request.URL.Query().Get("q")
+	result, err := srv.store.Dimensions(query, limit)
+	if err != nil {
+		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": map[string]string{
+			"code": "database_query_failed", "message": "Traffic dimensions could not be read from the local database.",
+		}})
+		return
+	}
+	writeJSON(response, http.StatusOK, dimensionsResponse{
+		APIVersion: "v1", Query: query, Limit: limit, Apps: result.Apps, Hosts: result.Hosts, Domains: result.Domains,
+	})
+}
+
+type rankingsResponse struct {
+	APIVersion string                   `json:"apiVersion"`
+	Scope      storage.TrafficScope     `json:"scope"`
+	Range      seriesRange              `json:"range"`
+	Dimension  storage.RankingDimension `json:"dimension"`
+	Direction  storage.RankingDirection `json:"direction"`
+	Limit      int                      `json:"limit"`
+	Items      []storage.Leader         `json:"items"`
+}
+
+func (srv *server) rankings(response http.ResponseWriter, request *http.Request) {
+	from, to, valid := requestedCanonicalTimeRange(request)
+	if !valid {
+		writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"code": "invalid_time_range", "message": "Provide from and to as RFC3339 timestamps with to after from; the range is [from, to).",
+		}})
+		return
+	}
+	dimension := storage.RankingDimension(request.URL.Query().Get("dimension"))
+	if dimension != storage.DimensionApp && dimension != storage.DimensionHost && dimension != storage.DimensionDomain {
+		writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"code": "invalid_dimension", "message": "Provide dimension as app, host, or domain.",
+		}})
+		return
+	}
+	direction := storage.RankingDirection(request.URL.Query().Get("direction"))
+	if direction != storage.DirectionUpload && direction != storage.DirectionDownload && direction != storage.DirectionTotal {
+		writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"code": "invalid_direction", "message": "Provide direction as upload, download, or total.",
+		}})
+		return
+	}
+	limit, valid := requestedLimit(request, 10)
+	if !valid {
+		writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"code": "invalid_limit", "message": "Provide limit as an integer from 1 through 100.",
+		}})
+		return
+	}
+	filter, valid := requestedTrafficFilter(request)
+	if !valid {
+		writeInvalidFilter(response)
+		return
+	}
+	result, err := srv.store.Rankings(storage.RankingOptions{
+		Start: from, End: to, Dimension: dimension, Direction: direction, Limit: limit, Filter: filter,
+	})
+	if err != nil {
+		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": map[string]string{
+			"code": "database_query_failed", "message": "Traffic rankings could not be read from the local database.",
+		}})
+		return
+	}
+	writeJSON(response, http.StatusOK, rankingsResponse{
+		APIVersion: "v1", Scope: result.Scope, Range: seriesRange{From: from.Format(time.RFC3339Nano), To: to.Format(time.RFC3339Nano)},
+		Dimension: dimension, Direction: direction, Limit: limit, Items: result.Items,
+	})
+}
+
+func requestedLimit(request *http.Request, fallback int) (int, bool) {
+	raw := request.URL.Query().Get("limit")
+	if raw == "" {
+		return fallback, true
+	}
+	limit, err := strconv.Atoi(raw)
+	return limit, err == nil && limit >= 1 && limit <= 100
+}
+
+func requestedTrafficFilter(request *http.Request) (storage.TrafficFilter, bool) {
+	query := request.URL.Query()
+	filter := storage.TrafficFilter{Apps: query["app"], Hosts: query["host"], Domains: query["domain"]}
+	for _, values := range [][]string{filter.Apps, filter.Hosts, filter.Domains} {
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" {
+				return storage.TrafficFilter{}, false
+			}
+		}
+	}
+	return filter, true
+}
+
+func writeInvalidFilter(response http.ResponseWriter) {
+	writeJSON(response, http.StatusBadRequest, map[string]any{"error": map[string]string{
+		"code": "invalid_filter", "message": "App, Host, and domain filters must be non-empty exact values.",
+	}})
 }
 
 func (srv *server) gaps(response http.ResponseWriter, request *http.Request) {

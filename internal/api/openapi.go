@@ -5,11 +5,25 @@ func openAPISpecification() map[string]any {
 	summaryReference := map[string]any{"$ref": "#/components/schemas/Summary"}
 	seriesReference := map[string]any{"$ref": "#/components/schemas/Series"}
 	gapsReference := map[string]any{"$ref": "#/components/schemas/Gaps"}
+	dimensionsReference := map[string]any{"$ref": "#/components/schemas/Dimensions"}
+	rankingsReference := map[string]any{"$ref": "#/components/schemas/Rankings"}
 	timeParameter := func(name string) map[string]any {
 		return map[string]any{
 			"name": name, "in": "query", "required": true,
 			"schema": map[string]any{"type": "string", "format": "date-time"},
 		}
+	}
+	filterParameters := func() []any {
+		parameters := []any{}
+		for _, dimension := range []string{"app", "host", "domain"} {
+			parameters = append(parameters, map[string]any{
+				"name": dimension, "in": "query", "required": false,
+				"description": "Repeat for OR matching within this dimension; filters across dimensions are ANDed. Values are exact and case-sensitive.",
+				"schema":      map[string]any{"type": "array", "items": map[string]any{"type": "string", "minLength": 1}},
+				"style":       "form", "explode": true,
+			})
+		}
+		return parameters
 	}
 	return map[string]any{
 		"openapi": "3.1.0",
@@ -18,6 +32,20 @@ func openAPISpecification() map[string]any {
 			"version": "1.0.0",
 		},
 		"paths": map[string]any{
+			"/api/v1/dimensions": map[string]any{
+				"get": map[string]any{
+					"operationId": "getTrafficDimensions",
+					"summary":     "Search retained Apps, exact Hosts, and Registrable domains",
+					"parameters": []any{
+						map[string]any{"name": "q", "in": "query", "required": false, "schema": map[string]any{"type": "string"}},
+						map[string]any{"name": "limit", "in": "query", "required": false, "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 20}},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{"description": "Canonical retained dimension values", "content": map[string]any{"application/json": map[string]any{"schema": dimensionsReference}}},
+						"400": map[string]any{"description": "Invalid result limit"},
+					},
+				},
+			},
 			"/api/v1/gaps": map[string]any{
 				"get": map[string]any{
 					"operationId": "getCollectionGaps",
@@ -36,7 +64,7 @@ func openAPISpecification() map[string]any {
 				"get": map[string]any{
 					"operationId": "getTrafficSummary",
 					"summary":     "Summarize permanent minute traffic in a half-open time range",
-					"parameters":  []any{timeParameter("from"), timeParameter("to")},
+					"parameters":  append([]any{timeParameter("from"), timeParameter("to")}, filterParameters()...),
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Directional attribution totals, coverage, and current leaders",
@@ -51,7 +79,7 @@ func openAPISpecification() map[string]any {
 					"operationId": "getTrafficSeries",
 					"summary":     "Read calendar-aligned traffic points from permanent minute history",
 					"description": "The range is [from, to). Auto selects the finest minute, hour, or day granularity that returns at most 400 non-empty points without truncating traffic.",
-					"parameters": []any{
+					"parameters": append([]any{
 						timeParameter("from"),
 						timeParameter("to"),
 						map[string]any{
@@ -63,7 +91,7 @@ func openAPISpecification() map[string]any {
 							"name": "granularity", "in": "query", "required": true,
 							"schema": map[string]any{"type": "string", "enum": []string{"minute", "hour", "day", "auto"}},
 						},
-					},
+					}, filterParameters()...),
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Directional attribution totals at the selected granularity",
@@ -71,6 +99,22 @@ func openAPISpecification() map[string]any {
 						},
 						"400": map[string]any{"description": "Invalid range, IANA time zone, or granularity"},
 						"422": map[string]any{"description": "Auto cannot represent the range within 400 daily points"},
+					},
+				},
+			},
+			"/api/v1/rankings": map[string]any{
+				"get": map[string]any{
+					"operationId": "getTrafficRankings",
+					"summary":     "Rank observed traffic by App, exact Host, or Registrable domain",
+					"parameters": append([]any{
+						timeParameter("from"), timeParameter("to"),
+						map[string]any{"name": "dimension", "in": "query", "required": true, "schema": map[string]any{"type": "string", "enum": []string{"app", "host", "domain"}}},
+						map[string]any{"name": "direction", "in": "query", "required": true, "schema": map[string]any{"type": "string", "enum": []string{"upload", "download", "total"}}},
+						map[string]any{"name": "limit", "in": "query", "required": false, "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 10}},
+					}, filterParameters()...),
+					"responses": map[string]any{
+						"200": map[string]any{"description": "Deterministically ordered observed traffic", "content": map[string]any{"application/json": map[string]any{"schema": rankingsReference}}},
+						"400": map[string]any{"description": "Invalid range, dimension, direction, limit, or filter"},
 					},
 				},
 			},
@@ -112,6 +156,18 @@ func openAPISpecification() map[string]any {
 		},
 		"components": map[string]any{
 			"schemas": map[string]any{
+				"Dimensions": map[string]any{
+					"type":     "object",
+					"required": []string{"apiVersion", "query", "limit", "apps", "hosts", "domains"},
+					"properties": map[string]any{
+						"apiVersion": map[string]any{"type": "string", "const": "v1"},
+						"query":      map[string]any{"type": "string"},
+						"limit":      map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
+						"apps":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"hosts":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"domains":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					},
+				},
 				"Gap": map[string]any{
 					"type":     "object",
 					"required": []string{"id", "startedAt", "endedAt", "open", "reason", "disposition", "recoveredUpload", "recoveredDownload"},
@@ -164,9 +220,10 @@ func openAPISpecification() map[string]any {
 				},
 				"Summary": map[string]any{
 					"type":     "object",
-					"required": []string{"apiVersion", "range", "upload", "download", "total", "coverage", "leaders"},
+					"required": []string{"apiVersion", "scope", "range", "upload", "download", "total", "coverage", "leaders"},
 					"properties": map[string]any{
 						"apiVersion": map[string]any{"type": "string", "const": "v1"},
+						"scope":      map[string]any{"type": "string", "enum": []string{"all", "observed"}},
 						"range": map[string]any{
 							"type":     "object",
 							"required": []string{"start", "end"},
@@ -201,9 +258,10 @@ func openAPISpecification() map[string]any {
 				},
 				"Series": map[string]any{
 					"type":     "object",
-					"required": []string{"apiVersion", "granularity", "pointLimit", "timeZone", "range", "points"},
+					"required": []string{"apiVersion", "scope", "granularity", "pointLimit", "timeZone", "range", "points"},
 					"properties": map[string]any{
 						"apiVersion":  map[string]any{"type": "string", "const": "v1"},
+						"scope":       map[string]any{"type": "string", "enum": []string{"all", "observed"}},
 						"granularity": map[string]any{"type": "string", "enum": []string{"minute", "hour", "day"}},
 						"pointLimit":  map[string]any{"type": "integer", "const": 400},
 						"timeZone":    map[string]any{"type": "string"},
@@ -216,6 +274,22 @@ func openAPISpecification() map[string]any {
 							},
 						},
 						"points": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/SeriesPoint"}},
+					},
+				},
+				"Rankings": map[string]any{
+					"type":     "object",
+					"required": []string{"apiVersion", "scope", "range", "dimension", "direction", "limit", "items"},
+					"properties": map[string]any{
+						"apiVersion": map[string]any{"type": "string", "const": "v1"},
+						"scope":      map[string]any{"type": "string", "const": "observed"},
+						"range": map[string]any{
+							"type": "object", "required": []string{"from", "to"},
+							"properties": map[string]any{"from": map[string]any{"type": "string", "format": "date-time"}, "to": map[string]any{"type": "string", "format": "date-time"}},
+						},
+						"dimension": map[string]any{"type": "string", "enum": []string{"app", "host", "domain"}},
+						"direction": map[string]any{"type": "string", "enum": []string{"upload", "download", "total"}},
+						"limit":     map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
+						"items":     map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Leader"}},
 					},
 				},
 				"Status": map[string]any{
