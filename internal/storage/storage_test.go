@@ -263,6 +263,141 @@ func TestMinuteTrafficUPSERTAndHalfOpenSummarySurviveReopen(t *testing.T) {
 	}
 }
 
+func TestDimensionsSearchesRetainedCanonicalValuesWithoutInventingIPDomains(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	minute := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: minute, Class: traffic.Observed, App: "Safari", Host: "api.example.com", RegistrableDomain: "example.com", Upload: 10, Download: 20},
+		{Minute: minute, Class: traffic.Observed, App: "curl", Host: "cdn.example.com", RegistrableDomain: "example.com", Upload: 20, Download: 10},
+		{Minute: minute, Class: traffic.Observed, App: "Mail", Host: "mail.example.net", RegistrableDomain: "example.net", Upload: 5, Download: 5},
+		{Minute: minute, Class: traffic.Observed, App: "ping", Host: "192.0.2.10", RegistrableDomain: "", Upload: 1, Download: 1},
+	}); err != nil {
+		t.Fatalf("seed dimensions: %v", err)
+	}
+
+	dimensions, err := store.Dimensions("EXAMPLE", 10)
+	if err != nil {
+		t.Fatalf("query dimensions: %v", err)
+	}
+	if got, want := strings.Join(dimensions.Apps, ","), ""; got != want {
+		t.Fatalf("matching Apps = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(dimensions.Hosts, ","), "api.example.com,cdn.example.com,mail.example.net"; got != want {
+		t.Fatalf("matching Hosts = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(dimensions.Domains, ","), "example.com,example.net"; got != want {
+		t.Fatalf("matching domains = %q, want %q", got, want)
+	}
+	limited, err := store.Dimensions("", 2)
+	if err != nil {
+		t.Fatalf("query limited dimensions: %v", err)
+	}
+	if got, want := strings.Join(limited.Hosts, ","), "192.0.2.10,api.example.com"; got != want {
+		t.Fatalf("limited Hosts = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(limited.Domains, ","), "example.com,example.net"; got != want {
+		t.Fatalf("limited domains = %q, want %q", got, want)
+	}
+}
+
+func TestFilteredSummaryAndSeriesUseORWithinDimensionsAndANDAcrossThem(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: start, Class: traffic.Observed, App: "Safari", Host: "api.example.com", RegistrableDomain: "example.com", Upload: 10, Download: 20},
+		{Minute: start, Class: traffic.Observed, App: "curl", Host: "cdn.example.com", RegistrableDomain: "example.com", Upload: 30, Download: 40},
+		{Minute: start, Class: traffic.Observed, App: "Mail", Host: "mail.example.com", RegistrableDomain: "example.com", Upload: 50, Download: 60},
+		{Minute: start.Add(time.Minute), Class: traffic.Observed, App: "Safari", Host: "api.example.net", RegistrableDomain: "example.net", Upload: 70, Download: 80},
+		{Minute: start, Class: traffic.Residual, Upload: 100, Download: 200},
+		{Minute: start.Add(time.Minute), Class: traffic.GapRecovered, Upload: 300, Download: 400},
+	}); err != nil {
+		t.Fatalf("seed filtered traffic: %v", err)
+	}
+	filter := storage.TrafficFilter{Apps: []string{"Safari", "curl"}, Domains: []string{"example.com"}}
+
+	summary, err := store.FilteredSummary(start, start.Add(2*time.Minute), filter)
+	if err != nil {
+		t.Fatalf("query filtered summary: %v", err)
+	}
+	if summary.Scope != storage.ScopeObserved || summary.Upload != (storage.AttributionTotals{Observed: 40, Total: 40}) || summary.Download != (storage.AttributionTotals{Observed: 60, Total: 60}) {
+		t.Fatalf("filtered summary = %+v", summary)
+	}
+	if summary.Coverage != 1 || len(summary.Apps) != 2 || len(summary.Hosts) != 2 {
+		t.Fatalf("filtered summary metadata/leaders = %+v", summary)
+	}
+
+	series, err := store.Series(storage.SeriesOptions{
+		Start: start, End: start.Add(2 * time.Minute), Granularity: storage.GranularityMinute, Location: time.UTC, Filter: filter,
+	})
+	if err != nil {
+		t.Fatalf("query filtered series: %v", err)
+	}
+	if series.Scope != storage.ScopeObserved || len(series.Points) != 1 || series.Points[0].Total != (storage.AttributionTotals{Observed: 100, Total: 100}) {
+		t.Fatalf("filtered series = %+v", series)
+	}
+
+	empty, err := store.FilteredSummary(start, start.Add(2*time.Minute), storage.TrafficFilter{Hosts: []string{"absent.example"}})
+	if err != nil {
+		t.Fatalf("query empty filtered summary: %v", err)
+	}
+	if empty.Scope != storage.ScopeObserved || empty.Total.Total != 0 || len(empty.Apps) != 0 || len(empty.Hosts) != 0 {
+		t.Fatalf("empty filtered summary = %+v", empty)
+	}
+}
+
+func TestRankingsSupportEveryDimensionDirectionAndDeterministicTies(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: start, Class: traffic.Observed, App: "Safari", Host: "api.example.com", RegistrableDomain: "example.com", Upload: 10, Download: 30},
+		{Minute: start.Add(time.Minute), Class: traffic.Observed, App: "Safari", Host: "cdn.example.com", RegistrableDomain: "example.com", Upload: 10, Download: 10},
+		{Minute: start, Class: traffic.Observed, App: "curl", Host: "api.example.net", RegistrableDomain: "example.net", Upload: 20, Download: 20},
+		{Minute: start, Class: traffic.Observed, App: "ping", Host: "192.0.2.10", Upload: 100, Download: 100},
+	}); err != nil {
+		t.Fatalf("seed rankings: %v", err)
+	}
+
+	apps, err := store.Rankings(storage.RankingOptions{Start: start, End: start.Add(2 * time.Minute), Dimension: storage.DimensionApp, Direction: storage.DirectionTotal, Limit: 2, Filter: storage.TrafficFilter{Domains: []string{"example.com", "example.net"}}})
+	if err != nil {
+		t.Fatalf("rank Apps: %v", err)
+	}
+	if len(apps.Items) != 2 || apps.Items[0].Name != "Safari" || apps.Items[0].Total != 60 || apps.Items[1].Name != "curl" {
+		t.Fatalf("App rankings = %+v", apps)
+	}
+	hosts, err := store.Rankings(storage.RankingOptions{Start: start, End: start.Add(2 * time.Minute), Dimension: storage.DimensionHost, Direction: storage.DirectionUpload, Limit: 10, Filter: storage.TrafficFilter{Domains: []string{"example.com", "example.net"}}})
+	if err != nil {
+		t.Fatalf("rank Hosts: %v", err)
+	}
+	if len(hosts.Items) != 3 || hosts.Items[0].Name != "api.example.net" || hosts.Items[1].Name != "api.example.com" || hosts.Items[2].Name != "cdn.example.com" {
+		t.Fatalf("Host upload rankings = %+v", hosts)
+	}
+	domains, err := store.Rankings(storage.RankingOptions{Start: start, End: start.Add(2 * time.Minute), Dimension: storage.DimensionDomain, Direction: storage.DirectionDownload, Limit: 10})
+	if err != nil {
+		t.Fatalf("rank domains: %v", err)
+	}
+	if domains.Scope != storage.ScopeObserved || len(domains.Items) != 2 || domains.Items[0].Name != "example.com" || domains.Items[1].Name != "example.net" {
+		t.Fatalf("domain rankings = %+v", domains)
+	}
+}
+
 func TestSeriesKeepsRepeatedDaylightSavingHoursDistinctAndPreservesTotals(t *testing.T) {
 	t.Parallel()
 

@@ -372,6 +372,123 @@ func TestSeriesReportsWhenAutoCannotFitTheDocumentedPointLimit(t *testing.T) {
 	}
 }
 
+func TestFilterDimensionAndRankingAPIsExposeObservedScopeAndRepeatedExactFilters(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "data", "traffic.db")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.AddTraffic([]traffic.Record{
+		{Minute: start, Class: traffic.Observed, App: "Safari", Host: "api.example.com", RegistrableDomain: "example.com", Upload: 10, Download: 20},
+		{Minute: start, Class: traffic.Observed, App: "curl", Host: "cdn.example.com", RegistrableDomain: "example.com", Upload: 30, Download: 40},
+		{Minute: start, Class: traffic.Observed, App: "Mail", Host: "mail.example.com", RegistrableDomain: "example.com", Upload: 50, Download: 60},
+		{Minute: start.Add(time.Minute), Class: traffic.Observed, App: "Safari", Host: "api.example.net", RegistrableDomain: "example.net", Upload: 70, Download: 80},
+		{Minute: start, Class: traffic.Residual, Upload: 100, Download: 200},
+	}); err != nil {
+		t.Fatalf("seed API traffic: %v", err)
+	}
+	handler := api.NewHandler(config.Config{DatabasePath: databasePath}, store, testAssets(t))
+
+	dimensionsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(dimensionsResponse, httptest.NewRequest(http.MethodGet, "/api/v1/dimensions?q=EXAMPLE&limit=2", nil))
+	var dimensions struct {
+		APIVersion string   `json:"apiVersion"`
+		Apps       []string `json:"apps"`
+		Hosts      []string `json:"hosts"`
+		Domains    []string `json:"domains"`
+	}
+	if err := json.Unmarshal(dimensionsResponse.Body.Bytes(), &dimensions); err != nil {
+		t.Fatalf("decode dimensions: %v", err)
+	}
+	if dimensionsResponse.Code != http.StatusOK || dimensions.APIVersion != "v1" || len(dimensions.Hosts) != 2 || len(dimensions.Domains) != 2 {
+		t.Fatalf("dimensions response = status %d %+v", dimensionsResponse.Code, dimensions)
+	}
+
+	filter := "&app=Safari&app=curl&domain=example.com"
+	summaryPath := "/api/v1/summary?from=" + url.QueryEscape(start.Format(time.RFC3339)) + "&to=" + url.QueryEscape(start.Add(2*time.Minute).Format(time.RFC3339)) + filter
+	summaryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(summaryResponse, httptest.NewRequest(http.MethodGet, summaryPath, nil))
+	var summary struct {
+		Scope string                    `json:"scope"`
+		Total storage.AttributionTotals `json:"total"`
+	}
+	if err := json.Unmarshal(summaryResponse.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode filtered summary: %v", err)
+	}
+	if summaryResponse.Code != http.StatusOK || summary.Scope != "observed" || summary.Total != (storage.AttributionTotals{Observed: 100, Total: 100}) {
+		t.Fatalf("filtered summary = status %d %+v", summaryResponse.Code, summary)
+	}
+
+	seriesPath := "/api/v1/series?from=" + url.QueryEscape(start.Format(time.RFC3339)) + "&to=" + url.QueryEscape(start.Add(2*time.Minute).Format(time.RFC3339)) + "&timeZone=UTC&granularity=minute" + filter
+	seriesResponse := httptest.NewRecorder()
+	handler.ServeHTTP(seriesResponse, httptest.NewRequest(http.MethodGet, seriesPath, nil))
+	var series struct {
+		Scope  string                `json:"scope"`
+		Points []storage.SeriesPoint `json:"points"`
+	}
+	if err := json.Unmarshal(seriesResponse.Body.Bytes(), &series); err != nil {
+		t.Fatalf("decode filtered series: %v", err)
+	}
+	if seriesResponse.Code != http.StatusOK || series.Scope != "observed" || len(series.Points) != 1 || series.Points[0].Total.Total != 100 {
+		t.Fatalf("filtered series = status %d %+v", seriesResponse.Code, series)
+	}
+
+	rankingPath := "/api/v1/rankings?from=" + url.QueryEscape(start.Format(time.RFC3339)) + "&to=" + url.QueryEscape(start.Add(2*time.Minute).Format(time.RFC3339)) + "&dimension=host&direction=upload&limit=2" + filter
+	rankingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rankingResponse, httptest.NewRequest(http.MethodGet, rankingPath, nil))
+	var rankings struct {
+		Scope     string                   `json:"scope"`
+		Dimension storage.RankingDimension `json:"dimension"`
+		Direction storage.RankingDirection `json:"direction"`
+		Limit     int                      `json:"limit"`
+		Items     []storage.Leader         `json:"items"`
+	}
+	if err := json.Unmarshal(rankingResponse.Body.Bytes(), &rankings); err != nil {
+		t.Fatalf("decode rankings: %v", err)
+	}
+	if rankingResponse.Code != http.StatusOK || rankings.Scope != "observed" || rankings.Dimension != storage.DimensionHost || rankings.Direction != storage.DirectionUpload || rankings.Limit != 2 || len(rankings.Items) != 2 || rankings.Items[0].Name != "cdn.example.com" {
+		t.Fatalf("rankings response = status %d %+v", rankingResponse.Code, rankings)
+	}
+}
+
+func TestDimensionAndRankingAPIsRejectInvalidOptions(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.Open(filepath.Join(t.TempDir(), "data", "traffic.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	handler := api.NewHandler(config.Config{}, store, testAssets(t))
+	for _, scenario := range []struct {
+		path string
+		code string
+	}{
+		{path: "/api/v1/dimensions?limit=0", code: "invalid_limit"},
+		{path: "/api/v1/rankings?from=2026-08-14T00%3A00%3A00Z&to=2026-08-14T01%3A00%3A00Z&dimension=rule&direction=total&limit=10", code: "invalid_dimension"},
+		{path: "/api/v1/rankings?from=2026-08-14T00%3A00%3A00Z&to=2026-08-14T01%3A00%3A00Z&dimension=app&direction=sideways&limit=10", code: "invalid_direction"},
+		{path: "/api/v1/rankings?from=2026-08-14T00%3A00%3A00Z&to=2026-08-14T01%3A00%3A00Z&dimension=app&direction=total&limit=101", code: "invalid_limit"},
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, scenario.path, nil))
+		var payload struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode %s: %v", scenario.path, err)
+		}
+		if response.Code != http.StatusBadRequest || payload.Error.Code != scenario.code {
+			t.Fatalf("%s = status %d code %q", scenario.path, response.Code, payload.Error.Code)
+		}
+	}
+}
+
 func TestSummaryRejectsMissingMalformedAndEmptyRanges(t *testing.T) {
 	t.Parallel()
 
@@ -460,6 +577,29 @@ func TestOpenAPIDescribesStatusWithoutSecretMaterial(t *testing.T) {
 	for _, name := range []string{"from", "to", "timeZone", "granularity"} {
 		if !parameterNames[name] {
 			t.Fatalf("series OpenAPI is missing %q query parameter", name)
+		}
+	}
+	for _, path := range []string{"/api/v1/dimensions", "/api/v1/rankings"} {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("OpenAPI is missing %s", path)
+		}
+	}
+	for _, schema := range []string{"Dimensions", "Rankings"} {
+		if _, ok := schemas[schema]; !ok {
+			t.Fatalf("OpenAPI is missing the %s schema", schema)
+		}
+	}
+	for _, path := range []string{"/api/v1/summary", "/api/v1/series", "/api/v1/rankings"} {
+		operation := paths[path].(map[string]any)["get"].(map[string]any)
+		parameters := operation["parameters"].([]any)
+		names := map[string]bool{}
+		for _, raw := range parameters {
+			names[raw.(map[string]any)["name"].(string)] = true
+		}
+		for _, name := range []string{"app", "host", "domain"} {
+			if !names[name] {
+				t.Fatalf("%s OpenAPI is missing repeated %q filters", path, name)
+			}
 		}
 	}
 	if _, ok := paths["/api/v1/gaps"]; !ok {

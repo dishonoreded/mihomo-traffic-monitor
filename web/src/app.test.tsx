@@ -100,10 +100,34 @@ const seriesResponse = {
   ],
 };
 
+const dimensionsResponse = {
+  apiVersion: "v1",
+  query: "",
+  limit: 100,
+  apps: ["curl", "Mail", "Safari"],
+  hosts: ["api.example.com", "cdn.example.com"],
+  domains: ["example.com", "example.net"],
+};
+
+const rankingItems = [
+  { name: "Mail", upload: 40, download: 80, total: 120 },
+  { name: "Safari", upload: 30, download: 60, total: 90 },
+];
+
+const rankingsResponse = {
+  apiVersion: "v1",
+  scope: "observed",
+  range: { from: "2026-08-14T10:00:00Z", to: "2026-08-14T12:00:00Z" },
+  dimension: "app",
+  direction: "total",
+  limit: 10,
+  items: rankingItems,
+};
+
 function mockAPI() {
 	return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 		const path = String(input);
-		const payload = path.startsWith("/api/v1/summary?") ? summaryResponse : path.startsWith("/api/v1/series?") ? emptySeriesResponse : statusResponse;
+		const payload = path.startsWith("/api/v1/summary?") ? summaryResponse : path.startsWith("/api/v1/series?") ? emptySeriesResponse : path.startsWith("/api/v1/dimensions?") ? dimensionsResponse : path.startsWith("/api/v1/rankings?") ? rankingsResponse : statusResponse;
 		return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 	});
 }
@@ -113,6 +137,81 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   window.history.replaceState({}, "", "/");
+});
+
+test("Analyze restores repeated filters and drills into rankings with focus movement", async () => {
+  const query = "from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=total&granularity=hour&app=Safari&app=curl&host=api.example.com&domain=example.com";
+  window.history.replaceState({}, "", `/analyze?${query}`);
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    let payload: unknown = statusResponse;
+    if (path.startsWith("/api/v1/series?")) payload = seriesResponse;
+    else if (path.startsWith("/api/v1/summary?")) payload = summaryResponse;
+    else if (path.startsWith("/api/v1/dimensions?")) payload = dimensionsResponse;
+    else if (path.startsWith("/api/v1/rankings?")) {
+      const dimension = new URL(path, "http://local").searchParams.get("dimension") ?? "app";
+      payload = { ...rankingsResponse, dimension };
+    }
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "Remove App Safari filter" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Remove App curl filter" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Remove Host api.example.com filter" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Remove domain example.com filter" })).toBeVisible();
+  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("app=Safari&app=curl&host=api.example.com&domain=example.com"), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+
+  const mail = await screen.findByRole("button", { name: /Filter App Mail.*120 B/i });
+  mail.focus();
+  await user.keyboard("{Enter}");
+
+  const params = new URLSearchParams(window.location.search);
+  expect(params.getAll("app")).toEqual(["Safari", "curl", "Mail"]);
+  expect(params.getAll("host")).toEqual(["api.example.com"]);
+  expect(params.getAll("domain")).toEqual(["example.com"]);
+  expect(await screen.findByRole("heading", { name: "Total traffic trend" })).toHaveFocus();
+});
+
+test("Analyze adds and removes exact retained dimension filters", async () => {
+  window.history.replaceState({}, "", "/analyze?from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=total&granularity=hour");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    const payload = path.startsWith("/api/v1/series?") ? seriesResponse : path.startsWith("/api/v1/dimensions?") ? dimensionsResponse : path.startsWith("/api/v1/rankings?") ? rankingsResponse : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200 });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  const appInput = await screen.findByRole("combobox", { name: "App filter" });
+  await user.type(appInput, "Mail");
+  await user.click(screen.getByRole("button", { name: "Add App filter" }));
+  expect(new URLSearchParams(window.location.search).getAll("app")).toEqual(["Mail"]);
+
+  await user.click(screen.getByRole("button", { name: "Remove App Mail filter" }));
+  expect(new URLSearchParams(window.location.search).getAll("app")).toEqual([]);
+});
+
+test("Analyze does not leave stale rankings interactive while a filtered query loads", async () => {
+  window.history.replaceState({}, "", "/analyze?from=2026-08-14T10%3A00%3A00.000Z&to=2026-08-14T12%3A00%3A00.000Z&timeZone=UTC&direction=total&granularity=hour");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input);
+    if (path.startsWith("/api/v1/rankings?") && path.includes("app=Mail")) {
+      return await new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError"))));
+    }
+    const payload = path.startsWith("/api/v1/series?") ? seriesResponse : path.startsWith("/api/v1/dimensions?") ? dimensionsResponse : path.startsWith("/api/v1/rankings?") ? rankingsResponse : path.startsWith("/api/v1/summary?") ? summaryResponse : statusResponse;
+    return new Response(JSON.stringify(payload), { status: 200 });
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: /Filter App Mail.*120 B/i })).toBeVisible();
+  await user.type(screen.getByRole("combobox", { name: "App filter" }), "Mail");
+  await user.click(screen.getByRole("button", { name: "Add App filter" }));
+
+  expect((await screen.findAllByText("Reading observed traffic")).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("button", { name: /Filter App Mail.*120 B/i })).not.toBeInTheDocument();
 });
 
 test("user can inspect the unavailable local observatory and navigate its empty states", async () => {

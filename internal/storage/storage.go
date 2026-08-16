@@ -43,7 +43,63 @@ type Leader struct {
 	Total    int64  `json:"total"`
 }
 
+type TrafficScope string
+
+const (
+	ScopeAll      TrafficScope = "all"
+	ScopeObserved TrafficScope = "observed"
+)
+
+type TrafficFilter struct {
+	Apps    []string
+	Hosts   []string
+	Domains []string
+}
+
+func (filter TrafficFilter) Active() bool {
+	return len(filter.Apps) > 0 || len(filter.Hosts) > 0 || len(filter.Domains) > 0
+}
+
+type DimensionValues struct {
+	Apps    []string `json:"apps"`
+	Hosts   []string `json:"hosts"`
+	Domains []string `json:"domains"`
+}
+
+type RankingDimension string
+
+const (
+	DimensionApp    RankingDimension = "app"
+	DimensionHost   RankingDimension = "host"
+	DimensionDomain RankingDimension = "domain"
+)
+
+type RankingDirection string
+
+const (
+	DirectionUpload   RankingDirection = "upload"
+	DirectionDownload RankingDirection = "download"
+	DirectionTotal    RankingDirection = "total"
+)
+
+type RankingOptions struct {
+	Start     time.Time
+	End       time.Time
+	Dimension RankingDimension
+	Direction RankingDirection
+	Limit     int
+	Filter    TrafficFilter
+}
+
+type TrafficRankings struct {
+	Scope     TrafficScope
+	Dimension RankingDimension
+	Direction RankingDirection
+	Items     []Leader
+}
+
 type TrafficSummary struct {
+	Scope    TrafficScope
 	Upload   AttributionTotals
 	Download AttributionTotals
 	Total    AttributionTotals
@@ -69,6 +125,7 @@ type SeriesOptions struct {
 	End         time.Time
 	Granularity Granularity
 	Location    *time.Location
+	Filter      TrafficFilter
 }
 
 type SeriesPoint struct {
@@ -80,43 +137,13 @@ type SeriesPoint struct {
 
 type TrafficSeries struct {
 	Granularity Granularity
+	Scope       TrafficScope
 	Points      []SeriesPoint
 }
 
 type seriesCandidate struct {
 	points   map[time.Time]*SeriesPoint
 	exceeded bool
-}
-
-type leaderQuery struct {
-	name      string
-	statement string
-}
-
-var appLeaders = leaderQuery{
-	name: "App",
-	statement: `
-		SELECT dimension.name, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
-		FROM minute_traffic AS traffic
-		JOIN apps AS dimension ON dimension.id = traffic.app_id
-		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
-		GROUP BY dimension.id, dimension.name
-		ORDER BY SUM(traffic.upload_bytes + traffic.download_bytes) DESC, dimension.name ASC
-		LIMIT 5
-	`,
-}
-
-var hostLeaders = leaderQuery{
-	name: "Host",
-	statement: `
-		SELECT dimension.host, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
-		FROM minute_traffic AS traffic
-		JOIN endpoints AS dimension ON dimension.id = traffic.endpoint_id
-		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
-		GROUP BY dimension.id, dimension.host
-		ORDER BY SUM(traffic.upload_bytes + traffic.download_bytes) DESC, dimension.host ASC
-		LIMIT 5
-	`,
 }
 
 func Open(path string) (*Store, error) {
@@ -568,16 +595,37 @@ func upsertEndpoint(transaction *sql.Tx, host, registrableDomain string) (int64,
 }
 
 func (store *Store) Summary(start, end time.Time) (TrafficSummary, error) {
+	return store.FilteredSummary(start, end, TrafficFilter{})
+}
+
+func (store *Store) FilteredSummary(start, end time.Time, filter TrafficFilter) (TrafficSummary, error) {
 	if !end.After(start) {
 		return TrafficSummary{}, fmt.Errorf("summary end must be after start")
 	}
-	result := TrafficSummary{Apps: []Leader{}, Hosts: []Leader{}}
-	rows, err := store.database.Query(`
+	result := TrafficSummary{Scope: ScopeAll, Apps: []Leader{}, Hosts: []Leader{}}
+	statement := `
 		SELECT attribution_class, COALESCE(SUM(upload_bytes), 0), COALESCE(SUM(download_bytes), 0)
-		FROM minute_traffic
-		WHERE minute >= ? AND minute < ?
+		FROM minute_traffic AS traffic
+		WHERE traffic.minute >= ? AND traffic.minute < ?
+	`
+	arguments := []any{unixCeiling(start), unixCeiling(end)}
+	if filter.Active() {
+		result.Scope = ScopeObserved
+		statement = `
+			SELECT traffic.attribution_class, COALESCE(SUM(traffic.upload_bytes), 0), COALESCE(SUM(traffic.download_bytes), 0)
+			FROM minute_traffic AS traffic
+			JOIN apps AS app ON app.id = traffic.app_id
+			JOIN endpoints AS endpoint ON endpoint.id = traffic.endpoint_id
+			WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
+		`
+		filterSQL, filterArguments := trafficFilterSQL(filter)
+		statement += filterSQL
+		arguments = append(arguments, filterArguments...)
+	}
+	statement += `
 		GROUP BY attribution_class
-	`, unixCeiling(start), unixCeiling(end))
+	`
+	rows, err := store.database.Query(statement, arguments...)
 	if err != nil {
 		return TrafficSummary{}, fmt.Errorf("query traffic summary: %w", err)
 	}
@@ -602,11 +650,11 @@ func (store *Store) Summary(start, end time.Time) (TrafficSummary, error) {
 	if result.Total.Total > 0 {
 		result.Coverage = float64(result.Total.Observed) / float64(result.Total.Total)
 	}
-	result.Apps, err = store.leaders(start, end, appLeaders)
+	result.Apps, err = store.dimensionLeaders(start, end, DimensionApp, DirectionTotal, 5, filter)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
-	result.Hosts, err = store.leaders(start, end, hostLeaders)
+	result.Hosts, err = store.dimensionLeaders(start, end, DimensionHost, DirectionTotal, 5, filter)
 	if err != nil {
 		return TrafficSummary{}, err
 	}
@@ -633,13 +681,29 @@ func (store *Store) Series(options SeriesOptions) (TrafficSeries, error) {
 	for _, granularity := range granularities {
 		candidates[granularity] = &seriesCandidate{points: make(map[time.Time]*SeriesPoint)}
 	}
-	rows, err := store.database.Query(`
+	statement := `
 		SELECT minute, attribution_class, SUM(upload_bytes), SUM(download_bytes)
-		FROM minute_traffic
-		WHERE minute >= ? AND minute < ?
+		FROM minute_traffic AS traffic
+		WHERE traffic.minute >= ? AND traffic.minute < ?
+	`
+	arguments := []any{unixCeiling(options.Start), unixCeiling(options.End)}
+	if options.Filter.Active() {
+		statement = `
+			SELECT traffic.minute, traffic.attribution_class, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
+			FROM minute_traffic AS traffic
+			JOIN apps AS app ON app.id = traffic.app_id
+			JOIN endpoints AS endpoint ON endpoint.id = traffic.endpoint_id
+			WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
+		`
+		filterSQL, filterArguments := trafficFilterSQL(options.Filter)
+		statement += filterSQL
+		arguments = append(arguments, filterArguments...)
+	}
+	statement += `
 		GROUP BY minute, attribution_class
 		ORDER BY minute
-	`, unixCeiling(options.Start), unixCeiling(options.End))
+	`
+	rows, err := store.database.Query(statement, arguments...)
 	if err != nil {
 		return TrafficSeries{}, fmt.Errorf("query traffic series: %w", err)
 	}
@@ -691,7 +755,11 @@ func (store *Store) Series(options SeriesOptions) (TrafficSeries, error) {
 		}
 	}
 	pointsByStart := candidates[selected].points
-	result := TrafficSeries{Granularity: selected, Points: make([]SeriesPoint, 0, len(pointsByStart))}
+	scope := ScopeAll
+	if options.Filter.Active() {
+		scope = ScopeObserved
+	}
+	result := TrafficSeries{Granularity: selected, Scope: scope, Points: make([]SeriesPoint, 0, len(pointsByStart))}
 	for _, point := range pointsByStart {
 		finalizeTotals(&point.Upload)
 		finalizeTotals(&point.Download)
@@ -780,23 +848,142 @@ func finalizeTotals(totals *AttributionTotals) {
 	totals.Total = totals.Observed + totals.Residual + totals.GapRecovered
 }
 
-func (store *Store) leaders(start, end time.Time, query leaderQuery) ([]Leader, error) {
-	rows, err := store.database.Query(query.statement, unixCeiling(start), unixCeiling(end))
+func trafficFilterSQL(filter TrafficFilter) (string, []any) {
+	statement := ""
+	arguments := []any{}
+	for _, values := range []struct {
+		column string
+		items  []string
+	}{
+		{column: "app.name", items: filter.Apps},
+		{column: "endpoint.host", items: filter.Hosts},
+		{column: "endpoint.registrable_domain", items: filter.Domains},
+	} {
+		if len(values.items) == 0 {
+			continue
+		}
+		statement += " AND " + values.column + " IN (" + placeholders(len(values.items)) + ")"
+		for _, value := range values.items {
+			arguments = append(arguments, value)
+		}
+	}
+	return statement, arguments
+}
+
+func placeholders(count int) string {
+	result := "?"
+	for index := 1; index < count; index++ {
+		result += ", ?"
+	}
+	return result
+}
+
+func (store *Store) Dimensions(search string, limit int) (DimensionValues, error) {
+	if limit < 1 {
+		return DimensionValues{}, fmt.Errorf("dimension limit must be positive")
+	}
+	result := DimensionValues{Apps: []string{}, Hosts: []string{}, Domains: []string{}}
+	queries := []struct {
+		name      string
+		statement string
+		target    *[]string
+	}{
+		{name: "Apps", statement: `SELECT name FROM apps WHERE instr(lower(name), lower(?)) > 0 ORDER BY name COLLATE NOCASE, name LIMIT ?`, target: &result.Apps},
+		{name: "Hosts", statement: `SELECT DISTINCT host FROM endpoints WHERE instr(lower(host), lower(?)) > 0 ORDER BY host COLLATE NOCASE, host LIMIT ?`, target: &result.Hosts},
+		{name: "domains", statement: `SELECT DISTINCT registrable_domain FROM endpoints WHERE registrable_domain != '' AND instr(lower(registrable_domain), lower(?)) > 0 ORDER BY registrable_domain COLLATE NOCASE, registrable_domain LIMIT ?`, target: &result.Domains},
+	}
+	for _, query := range queries {
+		rows, err := store.database.Query(query.statement, search, limit)
+		if err != nil {
+			return DimensionValues{}, fmt.Errorf("query %s dimensions: %w", query.name, err)
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				return DimensionValues{}, fmt.Errorf("scan %s dimension: %w", query.name, err)
+			}
+			*query.target = append(*query.target, value)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return DimensionValues{}, fmt.Errorf("iterate %s dimensions: %w", query.name, err)
+		}
+		if err := rows.Close(); err != nil {
+			return DimensionValues{}, fmt.Errorf("close %s dimensions: %w", query.name, err)
+		}
+	}
+	return result, nil
+}
+
+func (store *Store) Rankings(options RankingOptions) (TrafficRankings, error) {
+	if !options.End.After(options.Start) {
+		return TrafficRankings{}, fmt.Errorf("ranking end must be after start")
+	}
+	if options.Limit < 1 {
+		return TrafficRankings{}, fmt.Errorf("ranking limit must be positive")
+	}
+	if options.Dimension != DimensionApp && options.Dimension != DimensionHost && options.Dimension != DimensionDomain {
+		return TrafficRankings{}, fmt.Errorf("unsupported ranking dimension %q", options.Dimension)
+	}
+	if options.Direction != DirectionUpload && options.Direction != DirectionDownload && options.Direction != DirectionTotal {
+		return TrafficRankings{}, fmt.Errorf("unsupported ranking direction %q", options.Direction)
+	}
+	items, err := store.dimensionLeaders(options.Start, options.End, options.Dimension, options.Direction, options.Limit, options.Filter)
 	if err != nil {
-		return nil, fmt.Errorf("query %s leaders: %w", query.name, err)
+		return TrafficRankings{}, err
+	}
+	return TrafficRankings{Scope: ScopeObserved, Dimension: options.Dimension, Direction: options.Direction, Items: items}, nil
+}
+
+func (store *Store) dimensionLeaders(start, end time.Time, dimension RankingDimension, direction RankingDirection, limit int, filter TrafficFilter) ([]Leader, error) {
+	nameExpression := "app.name"
+	name := "App"
+	if dimension == DimensionHost {
+		nameExpression = "endpoint.host"
+		name = "Host"
+	} else if dimension == DimensionDomain {
+		nameExpression = "endpoint.registrable_domain"
+		name = "domain"
+	}
+	orderExpression := "SUM(traffic.upload_bytes + traffic.download_bytes)"
+	if direction == DirectionUpload {
+		orderExpression = "SUM(traffic.upload_bytes)"
+	} else if direction == DirectionDownload {
+		orderExpression = "SUM(traffic.download_bytes)"
+	}
+	statement := `
+		SELECT ` + nameExpression + `, SUM(traffic.upload_bytes), SUM(traffic.download_bytes)
+		FROM minute_traffic AS traffic
+		JOIN apps AS app ON app.id = traffic.app_id
+		JOIN endpoints AS endpoint ON endpoint.id = traffic.endpoint_id
+		WHERE traffic.minute >= ? AND traffic.minute < ? AND traffic.attribution_class = 'observed'
+	`
+	arguments := []any{unixCeiling(start), unixCeiling(end)}
+	filterSQL, filterArguments := trafficFilterSQL(filter)
+	statement += filterSQL
+	arguments = append(arguments, filterArguments...)
+	if dimension == DimensionDomain {
+		statement += " AND endpoint.registrable_domain != ''"
+	}
+	statement += " GROUP BY " + nameExpression + " ORDER BY " + orderExpression + " DESC, " + nameExpression + " ASC LIMIT ?"
+	arguments = append(arguments, limit)
+	rows, err := store.database.Query(statement, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("query %s leaders: %w", name, err)
 	}
 	defer rows.Close()
 	leaders := []Leader{}
 	for rows.Next() {
 		var leader Leader
 		if err := rows.Scan(&leader.Name, &leader.Upload, &leader.Download); err != nil {
-			return nil, fmt.Errorf("scan %s leader: %w", query.name, err)
+			return nil, fmt.Errorf("scan %s leader: %w", name, err)
 		}
 		leader.Total = leader.Upload + leader.Download
 		leaders = append(leaders, leader)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate %s leaders: %w", query.name, err)
+		return nil, fmt.Errorf("iterate %s leaders: %w", name, err)
 	}
 	return leaders, nil
 }

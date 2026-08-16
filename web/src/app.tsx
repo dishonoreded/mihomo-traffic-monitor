@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Route = "/" | "/analyze" | "/status";
 
@@ -70,6 +70,7 @@ interface Leader {
 
 interface SummaryResponse {
   apiVersion: string;
+  scope: "all" | "observed";
   range: { start: string; end: string };
   upload: AttributionTotals;
   download: AttributionTotals;
@@ -90,6 +91,7 @@ interface SeriesPoint {
 
 interface SeriesResponse {
   apiVersion: string;
+  scope: "all" | "observed";
   granularity: Exclude<Granularity, "auto">;
   pointLimit: number;
   timeZone: string;
@@ -103,6 +105,30 @@ interface AnalyzeQuery {
   timeZone: string;
   direction: Direction;
   granularity: Granularity;
+  apps: string[];
+  hosts: string[];
+  domains: string[];
+}
+
+type FilterDimension = "app" | "host" | "domain";
+
+interface DimensionsResponse {
+  apiVersion: string;
+  query: string;
+  limit: number;
+  apps: string[];
+  hosts: string[];
+  domains: string[];
+}
+
+interface RankingsResponse {
+  apiVersion: string;
+  scope: "observed";
+  range: { from: string; to: string };
+  dimension: FilterDimension;
+  direction: Direction;
+  limit: number;
+  items: Leader[];
 }
 
 const routes: Array<{ path: Route; label: string }> = [
@@ -349,6 +375,14 @@ function Analyze() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [formError, setFormError] = useState("");
+  const [dimensions, setDimensions] = useState<DimensionsResponse>({ apiVersion: "v1", query: "", limit: 100, apps: [], hosts: [], domains: [] });
+  const [dimensionsError, setDimensionsError] = useState("");
+  const [rankings, setRankings] = useState<Record<FilterDimension, RankingsResponse | null>>({ app: null, host: null, domain: null });
+  const [rankingsLoading, setRankingsLoading] = useState(true);
+  const [rankingsError, setRankingsError] = useState("");
+  const [filterDrafts, setFilterDrafts] = useState<Record<FilterDimension, string>>({ app: "", host: "", domain: "" });
+  const [focusAfterDrill, setFocusAfterDrill] = useState(false);
+  const trendHeading = useRef<HTMLHeadingElement>(null);
 
   const commitQuery = (next: AnalyzeQuery, mode: "push" | "replace" = "push") => {
     const url = `/analyze?${serializeAnalyzeQuery(next).toString()}`;
@@ -373,12 +407,30 @@ function Analyze() {
 
   useEffect(() => {
     const abort = new AbortController();
+    fetch("/api/v1/dimensions?limit=100", { signal: abort.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Dimensions request failed (${response.status})`);
+        return (await response.json()) as DimensionsResponse;
+      })
+      .then((result) => {
+        setDimensions(result);
+        setDimensionsError("");
+      })
+      .catch((reason: unknown) => {
+        if (!(reason instanceof DOMException && reason.name === "AbortError")) setDimensionsError(reason instanceof Error ? reason.message : "Traffic dimensions are unavailable");
+      });
+    return () => abort.abort();
+  }, []);
+
+  useEffect(() => {
+    const abort = new AbortController();
     const apiQuery = new URLSearchParams({
       from: query.from,
       to: query.to,
       timeZone: query.timeZone,
       granularity: query.granularity,
     });
+    appendTrafficFilters(apiQuery, query);
     setLoading(true);
     setError("");
     fetch(`/api/v1/series?${apiQuery.toString()}`, { signal: abort.signal })
@@ -397,7 +449,38 @@ function Analyze() {
         if (!abort.signal.aborted) setLoading(false);
       });
     return () => abort.abort();
-  }, [query.from, query.to, query.timeZone, query.granularity]);
+  }, [query.from, query.to, query.timeZone, query.granularity, query.apps, query.hosts, query.domains]);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const base = new URLSearchParams({ from: query.from, to: query.to, direction: query.direction, limit: "10" });
+    appendTrafficFilters(base, query);
+    setRankings({ app: null, host: null, domain: null });
+    setRankingsLoading(true);
+    setRankingsError("");
+    Promise.all((["app", "host", "domain"] as const).map(async (dimension) => {
+      const parameters = new URLSearchParams(base);
+      parameters.set("dimension", dimension);
+      const response = await fetch(`/api/v1/rankings?${parameters.toString()}`, { signal: abort.signal });
+      if (!response.ok) throw new Error(`Rankings request failed (${response.status})`);
+      return (await response.json()) as RankingsResponse;
+    }))
+      .then((results) => setRankings({ app: results[0], host: results[1], domain: results[2] }))
+      .catch((reason: unknown) => {
+        if (!(reason instanceof DOMException && reason.name === "AbortError")) setRankingsError(reason instanceof Error ? reason.message : "Traffic rankings are unavailable");
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setRankingsLoading(false);
+      });
+    return () => abort.abort();
+  }, [query.from, query.to, query.direction, query.apps, query.hosts, query.domains]);
+
+  useEffect(() => {
+    if (!loading && focusAfterDrill && series) {
+      trendHeading.current?.focus();
+      setFocusAfterDrill(false);
+    }
+  }, [focusAfterDrill, loading, series]);
 
   const applyRange = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -413,6 +496,25 @@ function Analyze() {
 
   const setDirection = (direction: Direction) => commitQuery({ ...query, direction });
   const setGranularity = (granularity: Granularity) => commitQuery({ ...query, granularity });
+  const addFilter = (dimension: FilterDimension, value = filterDrafts[dimension]) => {
+    const exact = value.trim();
+    if (!exact) return;
+    const key = analyzeFilterKey(dimension);
+    if (query[key].includes(exact)) return;
+    commitQuery({ ...query, [key]: [...query[key], exact] });
+    setFilterDrafts((current) => ({ ...current, [dimension]: "" }));
+  };
+  const removeFilter = (dimension: FilterDimension, value: string) => {
+    const key = analyzeFilterKey(dimension);
+    commitQuery({ ...query, [key]: query[key].filter((item) => item !== value) });
+  };
+  const drillDown = (dimension: FilterDimension, value: string) => {
+    const key = analyzeFilterKey(dimension);
+    if (query[key].includes(value)) return;
+    setLoading(true);
+    setFocusAfterDrill(true);
+    commitQuery({ ...query, [key]: [...query[key], value] });
+  };
 
   return (
     <section className="analyze-page">
@@ -448,19 +550,100 @@ function Analyze() {
         {formError ? <p className="control-error" role="alert">{formError}</p> : null}
       </form>
 
+      <TrafficFilters
+        query={query}
+        dimensions={dimensions}
+        error={dimensionsError}
+        drafts={filterDrafts}
+        setDraft={(dimension, value) => setFilterDrafts((current) => ({ ...current, [dimension]: value }))}
+        add={addFilter}
+        remove={removeFilter}
+      />
+
+      {hasTrafficFilters(query) ? <p className="observed-scope">Filtered results contain matching Observed traffic only.</p> : null}
+
       <div className="analysis-stage">
         {loading ? <AnalysisState heading="Reading traffic history" detail="Querying the permanent local minute store." /> : error ? <AnalysisState heading="History could not be read" detail={error} alert /> : series && series.points.length > 0 ? (
           <>
-            <HistoricalTrend series={series} direction={query.direction} />
+            <HistoricalTrend series={series} direction={query.direction} headingRef={trendHeading} />
             <TrafficPointTable series={series} direction={query.direction} />
           </>
         ) : <AnalysisState heading="No traffic in this range" detail="Choose a wider range or wait until the collector stores a complete minute." />}
+      </div>
+      <TrafficRankings rankings={rankings} loading={rankingsLoading} direction={query.direction} error={rankingsError} selected={query} drillDown={drillDown} />
+    </section>
+  );
+}
+
+function TrafficFilters({ query, dimensions, error, drafts, setDraft, add, remove }: {
+  query: AnalyzeQuery;
+  dimensions: DimensionsResponse;
+  error: string;
+  drafts: Record<FilterDimension, string>;
+  setDraft: (dimension: FilterDimension, value: string) => void;
+  add: (dimension: FilterDimension) => void;
+  remove: (dimension: FilterDimension, value: string) => void;
+}) {
+  return (
+    <section className="traffic-filters" aria-labelledby="traffic-filters-title">
+      <div className="filter-heading"><h2 id="traffic-filters-title">Filters</h2><span>OR within / AND across</span></div>
+      <div className="filter-inputs">
+        {(["app", "host", "domain"] as const).map((dimension) => {
+          const label = dimensionLabel(dimension);
+          const list = dimensions[analyzeFilterKey(dimension)] ?? [];
+          return (
+            <div className="filter-input" key={dimension}>
+              <label htmlFor={`filter-${dimension}`}>{label} filter</label>
+              <div><input id={`filter-${dimension}`} list={`filter-${dimension}-values`} value={drafts[dimension]} onChange={(event) => setDraft(dimension, event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add(dimension); } }} />
+                <button type="button" onClick={() => add(dimension)} aria-label={`Add ${label} filter`}>Add</button></div>
+              <datalist id={`filter-${dimension}-values`}>{list.map((value) => <option value={value} key={value} />)}</datalist>
+            </div>
+          );
+        })}
+      </div>
+      <div className="filter-chips">
+        {(["app", "host", "domain"] as const).flatMap((dimension) => query[analyzeFilterKey(dimension)].map((value) => (
+          <button type="button" key={`${dimension}:${value}`} onClick={() => remove(dimension, value)} aria-label={`Remove ${dimensionLabel(dimension)} ${value} filter`}>
+            <span>{dimensionLabel(dimension)}</span>{value}<b aria-hidden="true">x</b>
+          </button>
+        )))}
+      </div>
+      {error ? <p className="filter-error" role="alert">{error}</p> : null}
+    </section>
+  );
+}
+
+function TrafficRankings({ rankings, loading, direction, error, selected, drillDown }: {
+  rankings: Record<FilterDimension, RankingsResponse | null>;
+  loading: boolean;
+  direction: Direction;
+  error: string;
+  selected: AnalyzeQuery;
+  drillDown: (dimension: FilterDimension, value: string) => void;
+}) {
+  return (
+    <section className="traffic-rankings" aria-labelledby="traffic-rankings-title">
+      <header><div><p className="eyebrow">Observed traffic</p><h2 id="traffic-rankings-title">Rankings</h2></div><span>{humanizeReason(direction)} order</span></header>
+      {error ? <p className="ranking-error" role="alert">{error}</p> : null}
+      <div className="ranking-columns">
+        {(["app", "host", "domain"] as const).map((dimension) => {
+          const items = rankings[dimension]?.items ?? [];
+          return <section className="ranking-list" aria-label={`${dimensionLabel(dimension)} rankings`} key={dimension}>
+            <h3>{dimensionLabel(dimension)}s</h3>
+            {loading ? <p>Reading observed traffic</p> : rankings[dimension] && items.length === 0 ? <p>No matching observed traffic</p> : (
+              <ol>{items.map((item, index) => {
+                const active = selected[analyzeFilterKey(dimension)].includes(item.name);
+                return <li key={item.name}><button type="button" disabled={active} onClick={() => drillDown(dimension, item.name)} aria-label={`Filter ${dimensionLabel(dimension)} ${item.name}, ${formatBytes(item[direction])}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name}</strong><b>{formatBytes(item[direction])}</b></button></li>;
+              })}</ol>
+            )}
+          </section>;
+        })}
       </div>
     </section>
   );
 }
 
-function HistoricalTrend({ series, direction }: { series: SeriesResponse; direction: Direction }) {
+function HistoricalTrend({ series, direction, headingRef }: { series: SeriesResponse; direction: Direction; headingRef: React.RefObject<HTMLHeadingElement | null> }) {
   const values = series.points.map((point) => point[direction].total);
   const peak = Math.max(1, ...values);
   const x = (index: number) => series.points.length === 1 ? 450 : 30 + (index / (series.points.length - 1)) * 840;
@@ -470,6 +653,7 @@ function HistoricalTrend({ series, direction }: { series: SeriesResponse; direct
   const label = `${humanizeReason(direction)} traffic trend, ${series.points.length} points, ${formatBytes(selectedTotal)} in the selected range`;
   return (
     <section className={`historical-trend trend-${direction}`}>
+      <h2 className="trend-focus-heading" ref={headingRef} tabIndex={-1}>{humanizeReason(direction)} traffic trend</h2>
       <div className="trend-readout"><span>{humanizeReason(direction)} / selected range</span><strong>{formatBytes(selectedTotal)}</strong><small>Peak {formatBytes(peak)} per {series.granularity}</small></div>
       <svg viewBox="0 0 900 280" preserveAspectRatio="none" role="img" aria-label={label}>
         <line x1="0" y1="250" x2="900" y2="250" className="history-axis" />
@@ -607,17 +791,44 @@ function readAnalyzeQuery(): AnalyzeQuery {
     timeZone: isTimeZone(requestedZone) ? requestedZone : browserTimeZone(),
     direction: direction === "upload" || direction === "download" || direction === "total" ? direction : "total",
     granularity: granularity === "minute" || granularity === "hour" || granularity === "day" || granularity === "auto" ? granularity : "auto",
+    apps: params.getAll("app"),
+    hosts: params.getAll("host"),
+    domains: params.getAll("domain"),
   };
 }
 
 function serializeAnalyzeQuery(query: AnalyzeQuery): URLSearchParams {
-  return new URLSearchParams({
+  const parameters = new URLSearchParams({
     from: query.from,
     to: query.to,
     timeZone: query.timeZone,
     direction: query.direction,
     granularity: query.granularity,
   });
+  appendTrafficFilters(parameters, query);
+  return parameters;
+}
+
+function appendTrafficFilters(parameters: URLSearchParams, query: AnalyzeQuery) {
+  for (const value of query.apps) parameters.append("app", value);
+  for (const value of query.hosts) parameters.append("host", value);
+  for (const value of query.domains) parameters.append("domain", value);
+}
+
+function analyzeFilterKey(dimension: FilterDimension): "apps" | "hosts" | "domains" {
+  if (dimension === "app") return "apps";
+  if (dimension === "host") return "hosts";
+  return "domains";
+}
+
+function dimensionLabel(dimension: FilterDimension): string {
+  if (dimension === "app") return "App";
+  if (dimension === "host") return "Host";
+  return "domain";
+}
+
+function hasTrafficFilters(query: AnalyzeQuery): boolean {
+  return query.apps.length > 0 || query.hosts.length > 0 || query.domains.length > 0;
 }
 
 function browserTimeZone(): string {
